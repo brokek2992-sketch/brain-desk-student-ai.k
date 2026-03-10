@@ -228,16 +228,38 @@ async def login(request: Request):
     return {"authorization_url": authorization_url}
 
 @api_router.get("/auth/callback")
-async def auth_callback(request: Request, code: str, state: str):
+async def auth_callback(request: Request, code: str = None, state: str = None, error: str = None):
     """Handle Google OAuth callback"""
     try:
-        logger.info(f"OAuth callback received - code: {code[:20]}..., state: {state}")
+        # Check if Google returned an error
+        if error:
+            logger.error(f"OAuth error from Google: {error}")
+            return RedirectResponse(
+                url=f"https://brain-desk-1.preview.emergentagent.com/auth/login?error=google_{error}"
+            )
         
-        # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-        # Use the fixed redirect_uri (not from session due to domain mismatch)
+        # Validate required parameters
+        if not code or not state:
+            logger.error(f"Missing OAuth parameters - code: {bool(code)}, state: {bool(state)}")
+            return RedirectResponse(
+                url="https://brain-desk-1.preview.emergentagent.com/auth/login?error=missing_parameters"
+            )
+        
+        logger.info(f"OAuth callback received - code: {code[:20]}..., state: {state[:10]}...")
+        logger.info(f"Request headers: {dict(request.headers)}")
+        
+        # Use the fixed redirect_uri
         redirect_uri = "http://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
-        
         logger.info(f"Using redirect_uri: {redirect_uri}")
+        
+        # Verify environment variables are loaded
+        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+            logger.error("Google OAuth credentials not configured!")
+            return RedirectResponse(
+                url="https://brain-desk-1.preview.emergentagent.com/auth/login?error=config_error"
+            )
+        
+        logger.info(f"Using Client ID: {GOOGLE_CLIENT_ID[:20]}...")
         
         flow = Flow.from_client_config(
             {
