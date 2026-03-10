@@ -193,7 +193,8 @@ async def health_check():
 async def login(request: Request):
     """Initiate Google OAuth flow"""
     # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    redirect_uri = f"{request.url.scheme}://{request.url.netloc}/api/auth/callback"
+    # Use the canonical callback URL that matches Google Cloud Console configuration
+    redirect_uri = "http://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
     
     flow = Flow.from_client_config(
         {
@@ -216,13 +217,15 @@ async def login(request: Request):
     )
     
     request.session['state'] = state
+    request.session['redirect_uri'] = redirect_uri  # Store for callback
     return {"authorization_url": authorization_url}
 
 @api_router.get("/auth/callback")
 async def auth_callback(request: Request, code: str, state: str):
     """Handle Google OAuth callback"""
     # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    redirect_uri = f"{request.url.scheme}://{request.url.netloc}/api/auth/callback"
+    # Use the SAME redirect_uri that was used in the login endpoint
+    redirect_uri = request.session.get('redirect_uri', "http://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback")
     
     flow = Flow.from_client_config(
         {
@@ -287,8 +290,9 @@ async def auth_callback(request: Request, code: str, state: str):
     # Store user_id in session
     request.session['user_id'] = user_id
     
-    # Redirect to frontend
-    return RedirectResponse(url=f"{request.url.scheme}://{request.url.netloc}/")
+    # Redirect to frontend homepage
+    frontend_url = "https://brain-desk-1.preview.emergentagent.com"
+    return RedirectResponse(url=frontend_url)
 
 @api_router.get("/auth/me")
 async def get_me(user: User = Depends(get_current_user)):
