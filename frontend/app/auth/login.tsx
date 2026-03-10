@@ -2,11 +2,11 @@ import React, { useEffect } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Image } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as WebBrowser from 'expo-web-browser';
-import { useAuthStore } from '../src/store/authStore';
-import { colors } from '../src/utils/colors';
-import { LoadingSpinner } from '../src/components/LoadingSpinner';
+import { useAuthStore } from '../../src/store/authStore';
+import { colors } from '../../src/utils/colors';
+import { LoadingSpinner } from '../../src/components/LoadingSpinner';
 import { Ionicons } from '@expo/vector-icons';
-import api from '../src/utils/api';
+import api from '../../src/utils/api';
 
 WebBrowser.maybeCompleteAuthSession();
 
