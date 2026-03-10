@@ -50,14 +50,14 @@ SCOPES = [
 # Create the main app
 app = FastAPI()
 
-# Add session middleware with proper cookie settings
+# Add session middleware with proper cookie settings for HTTPS
 app.add_middleware(
     SessionMiddleware, 
     secret_key=os.environ.get('SECRET_KEY', 'your-secret-key-here-change-in-production'),
     session_cookie='brain_desk_session',
     max_age=86400 * 7,  # 7 days
     same_site='none',  # Allow cross-domain cookies
-    https_only=False  # Allow HTTP for local development
+    https_only=True  # Use HTTPS cookies
 )
 
 # Create a router with the /api prefix
@@ -201,7 +201,7 @@ async def login(request: Request):
     """Initiate Google OAuth flow"""
     # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
     # Use the canonical callback URL that matches Google Cloud Console configuration
-    redirect_uri = "http://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
+    redirect_uri = "https://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
     
     flow = Flow.from_client_config(
         {
@@ -248,8 +248,8 @@ async def auth_callback(request: Request, code: str = None, state: str = None, e
         logger.info(f"OAuth callback received - code: {code[:20]}..., state: {state[:10]}...")
         logger.info(f"Request headers: {dict(request.headers)}")
         
-        # Use the fixed redirect_uri
-        redirect_uri = "http://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
+        # Use the fixed redirect_uri - MUST BE HTTPS
+        redirect_uri = "https://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
         logger.info(f"Using redirect_uri: {redirect_uri}")
         
         # Verify environment variables are loaded
