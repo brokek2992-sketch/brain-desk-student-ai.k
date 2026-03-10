@@ -50,8 +50,15 @@ SCOPES = [
 # Create the main app
 app = FastAPI()
 
-# Add session middleware
-app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', 'your-secret-key-here-change-in-production'))
+# Add session middleware with proper cookie settings
+app.add_middleware(
+    SessionMiddleware, 
+    secret_key=os.environ.get('SECRET_KEY', 'your-secret-key-here-change-in-production'),
+    session_cookie='brain_desk_session',
+    max_age=86400 * 7,  # 7 days
+    same_site='none',  # Allow cross-domain cookies
+    https_only=False  # Allow HTTP for local development
+)
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -223,25 +230,97 @@ async def login(request: Request):
 @api_router.get("/auth/callback")
 async def auth_callback(request: Request, code: str, state: str):
     """Handle Google OAuth callback"""
-    # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    # Use the SAME redirect_uri that was used in the login endpoint
-    redirect_uri = request.session.get('redirect_uri', "http://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback")
-    
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [redirect_uri]
-            }
-        },
-        scopes=SCOPES
-    )
-    flow.redirect_uri = redirect_uri
-    
-    flow.fetch_token(code=code)
+    try:
+        logger.info(f"OAuth callback received - code: {code[:20]}..., state: {state}")
+        
+        # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+        # Use the fixed redirect_uri (not from session due to domain mismatch)
+        redirect_uri = "http://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
+        
+        logger.info(f"Using redirect_uri: {redirect_uri}")
+        
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [redirect_uri]
+                }
+            },
+            scopes=SCOPES
+        )
+        flow.redirect_uri = redirect_uri
+        
+        logger.info("Fetching token from Google...")
+        flow.fetch_token(code=code)
+        
+        credentials = flow.credentials
+        logger.info("Token fetched successfully")
+        
+        # Get user info
+        from google.oauth2 import id_token
+        from google.auth.transport import requests
+        
+        logger.info("Verifying ID token...")
+        id_info = id_token.verify_oauth2_token(
+            credentials.id_token,
+            requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+        
+        google_id = id_info['sub']
+        email = id_info['email']
+        name = id_info.get('name', email)
+        picture = id_info.get('picture', '')
+        
+        logger.info(f"User authenticated: {email}")
+        
+        # Check if user exists
+        existing_user = await db.users.find_one({"google_id": google_id})
+        
+        if existing_user:
+            # Update tokens
+            await db.users.update_one(
+                {"google_id": google_id},
+                {"$set": {
+                    "access_token": credentials.token,
+                    "refresh_token": credentials.refresh_token,
+                    "picture": picture
+                }}
+            )
+            user_id = existing_user['id']
+            logger.info(f"Updated existing user: {user_id}")
+        else:
+            # Create new user
+            user = User(
+                google_id=google_id,
+                email=email,
+                name=name,
+                picture=picture,
+                access_token=credentials.token,
+                refresh_token=credentials.refresh_token
+            )
+            await db.users.insert_one(user.dict())
+            user_id = user.id
+            logger.info(f"Created new user: {user_id}")
+        
+        # Store user_id in session (create new session for this domain)
+        request.session['user_id'] = user_id
+        logger.info("Session created successfully")
+        
+        # Redirect to frontend homepage
+        frontend_url = "https://brain-desk-1.preview.emergentagent.com"
+        logger.info(f"Redirecting to: {frontend_url}")
+        return RedirectResponse(url=frontend_url)
+        
+    except Exception as e:
+        logger.error(f"OAuth callback error: {str(e)}", exc_info=True)
+        # Return error page instead of 403
+        return RedirectResponse(
+            url=f"https://brain-desk-1.preview.emergentagent.com/auth/login?error={str(e)}"
+        )
     
     credentials = flow.credentials
     
