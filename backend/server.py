@@ -226,33 +226,23 @@ async def login(request: Request):
             'redirect_uri': OAUTH_CALLBACK_URL
         }
         
-        # Build Google OAuth flow (disable PKCE)
-        flow = Flow.from_client_config(
-            {
-                "web": {
-                    "client_id": GOOGLE_CLIENT_ID,
-                    "client_secret": GOOGLE_CLIENT_SECRET,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": [OAUTH_CALLBACK_URL]
-                }
-            },
-            scopes=SCOPES
-        )
-        flow.redirect_uri = OAUTH_CALLBACK_URL
+        # Build authorization URL manually WITHOUT Flow/PKCE
+        from urllib.parse import urlencode
         
-        # Disable PKCE by removing code_verifier
-        flow.code_verifier = None
+        auth_params = {
+            'client_id': GOOGLE_CLIENT_ID,
+            'redirect_uri': OAUTH_CALLBACK_URL,
+            'response_type': 'code',
+            'scope': ' '.join(SCOPES),
+            'state': state,
+            'access_type': 'offline',
+            'include_granted_scopes': 'true',
+            'prompt': 'consent'
+        }
         
-        # Generate authorization URL without PKCE
-        authorization_url, _ = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true',
-            prompt='consent',
-            state=state
-        )
+        authorization_url = f"https://accounts.google.com/o/oauth2/auth?{urlencode(auth_params)}"
         
-        logger.info(f"Authorization URL generated successfully")
+        logger.info(f"Authorization URL generated successfully (WITHOUT PKCE)")
         logger.info(f"Redirect URI in URL: {OAUTH_CALLBACK_URL}")
         
         return {"authorization_url": authorization_url}
