@@ -6,6 +6,7 @@ import {
   ScrollView,
   RefreshControl,
   TouchableOpacity,
+  Alert,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -162,7 +163,7 @@ export default function HomeScreen() {
               <NoteCard
                 key={note.id}
                 note={note}
-                onPress={() => router.push('/courses')}
+                onPress={() => openNoteDetail(note)}
               />
             ))}
           </View>
@@ -226,10 +227,29 @@ const NoteCard = ({ note, onPress }: { note: Note; onPress: () => void }) => (
         <Text style={styles.noteTime}>
           {formatDistanceToNow(new Date(note.updated_at), { addSuffix: true })}
         </Text>
+        <Text style={styles.notePreview} numberOfLines={2}>
+          {note.content.substring(0, 100)}...
+        </Text>
       </View>
+      <Ionicons name="chevron-forward" size={20} color={colors.textMuted} />
     </View>
   </Card>
 );
+
+const openNoteDetail = (note: Note) => {
+  // Show note content in alert for now
+  Alert.alert(
+    note.title,
+    note.content.length > 500 ? note.content.substring(0, 500) + '...' : note.content,
+    [
+      { text: 'Close', style: 'cancel' },
+      {
+        text: 'Ask AI',
+        onPress: () => router.push(`/(tabs)/tutor`),
+      },
+    ]
+  );
+};
 
 const formatDueDate = (dateStr: string) => {
   const date = new Date(dateStr);
@@ -376,5 +396,10 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: '#FFF',
+  },
+  notePreview: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 4,
   },
 });
