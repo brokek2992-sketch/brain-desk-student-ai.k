@@ -194,73 +194,39 @@ async def health_check():
     """Health check endpoint"""
     return {"message": "Hello World", "status": "healthy", "service": "Brain Desk API"}
 
+# ==================== OAuth Configuration ====================
+
+# Canonical URLs - DO NOT CHANGE
+OAUTH_CALLBACK_URL = "https://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
+FRONTEND_URL = "https://brain-desk-1.preview.emergentagent.com"
+
+# In-memory state storage (use Redis in production)
+oauth_states = {}
+
 # ==================== Authentication Routes ====================
 
 @api_router.get("/auth/login")
 async def login(request: Request):
     """Initiate Google OAuth flow"""
-    # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    # Use the canonical callback URL that matches Google Cloud Console configuration
-    redirect_uri = "https://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
-    
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [redirect_uri]
-            }
-        },
-        scopes=SCOPES
-    )
-    flow.redirect_uri = redirect_uri
-    
-    authorization_url, state = flow.authorization_url(
-        access_type='offline',
-        include_granted_scopes='true',
-        prompt='consent'
-    )
-    
-    request.session['state'] = state
-    request.session['redirect_uri'] = redirect_uri  # Store for callback
-    return {"authorization_url": authorization_url}
-
-@api_router.get("/auth/callback")
-async def auth_callback(request: Request, code: str = None, state: str = None, error: str = None):
-    """Handle Google OAuth callback"""
     try:
-        # Check if Google returned an error
-        if error:
-            logger.error(f"OAuth error from Google: {error}")
-            return RedirectResponse(
-                url=f"https://brain-desk-1.preview.emergentagent.com/auth/login?error=google_{error}"
-            )
+        # Generate secure random state
+        import secrets
+        state = secrets.token_urlsafe(32)
         
-        # Validate required parameters
-        if not code or not state:
-            logger.error(f"Missing OAuth parameters - code: {bool(code)}, state: {bool(state)}")
-            return RedirectResponse(
-                url="https://brain-desk-1.preview.emergentagent.com/auth/login?error=missing_parameters"
-            )
+        logger.info("=" * 80)
+        logger.info("OAUTH LOGIN INITIATED")
+        logger.info(f"Generated state: {state}")
+        logger.info(f"Callback URL: {OAUTH_CALLBACK_URL}")
+        logger.info(f"Client ID: {GOOGLE_CLIENT_ID[:20]}...")
+        logger.info("=" * 80)
         
-        logger.info(f"OAuth callback received - code: {code[:20]}..., state: {state[:10]}...")
-        logger.info(f"Request headers: {dict(request.headers)}")
+        # Store state with timestamp
+        oauth_states[state] = {
+            'created_at': datetime.utcnow(),
+            'redirect_uri': OAUTH_CALLBACK_URL
+        }
         
-        # Use the fixed redirect_uri - MUST BE HTTPS
-        redirect_uri = "https://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
-        logger.info(f"Using redirect_uri: {redirect_uri}")
-        
-        # Verify environment variables are loaded
-        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-            logger.error("Google OAuth credentials not configured!")
-            return RedirectResponse(
-                url="https://brain-desk-1.preview.emergentagent.com/auth/login?error=config_error"
-            )
-        
-        logger.info(f"Using Client ID: {GOOGLE_CLIENT_ID[:20]}...")
-        
+        # Build Google OAuth flow
         flow = Flow.from_client_config(
             {
                 "web": {
@@ -268,15 +234,226 @@ async def auth_callback(request: Request, code: str = None, state: str = None, e
                     "client_secret": GOOGLE_CLIENT_SECRET,
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                     "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": [redirect_uri]
+                    "redirect_uris": [OAUTH_CALLBACK_URL]
                 }
             },
             scopes=SCOPES
         )
-        flow.redirect_uri = redirect_uri
+        flow.redirect_uri = OAUTH_CALLBACK_URL
         
-        logger.info("Fetching token from Google...")
-        flow.fetch_token(code=code)
+        # Generate authorization URL
+        authorization_url, _ = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent',
+            state=state
+        )
+        
+        logger.info(f"Authorization URL generated successfully")
+        logger.info(f"Redirect URI in URL: {OAUTH_CALLBACK_URL}")
+        
+        return {"authorization_url": authorization_url}
+        
+    except Exception as e:
+        logger.error(f"ERROR in login endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/auth/callback")
+async def auth_callback(
+    request: Request,
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    iss: str = None,
+    hd: str = None
+):
+    """Handle Google OAuth callback"""
+    
+    logger.info("=" * 80)
+    logger.info("OAUTH CALLBACK RECEIVED")
+    logger.info(f"Request URL: {request.url}")
+    logger.info(f"Request method: {request.method}")
+    logger.info(f"Query params: code={bool(code)}, state={state[:10] if state else None}..., error={error}")
+    logger.info(f"Additional params: iss={iss}, hd={hd}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    logger.info("=" * 80)
+    
+    try:
+        # Check for Google error
+        if error:
+            logger.error(f"Google OAuth error: {error}")
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=google_error&message={error}"
+            )
+        
+        # Validate required parameters
+        if not code:
+            logger.error("Missing authorization code")
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=missing_code"
+            )
+        
+        if not state:
+            logger.error("Missing state parameter")
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=missing_state"
+            )
+        
+        logger.info(f"Received code: {code[:20]}...")
+        logger.info(f"Received state: {state}")
+        
+        # Validate state
+        if state not in oauth_states:
+            logger.error(f"Invalid state received: {state}")
+            logger.error(f"Valid states in memory: {list(oauth_states.keys())}")
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=invalid_state"
+            )
+        
+        stored_state = oauth_states[state]
+        logger.info(f"State validation passed")
+        logger.info(f"State created at: {stored_state['created_at']}")
+        
+        # Clean up used state
+        del oauth_states[state]
+        
+        # Verify credentials
+        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+            logger.error("Google OAuth credentials not configured")
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=config_error"
+            )
+        
+        logger.info(f"Using Client ID: {GOOGLE_CLIENT_ID[:20]}...")
+        logger.info(f"Using redirect_uri: {OAUTH_CALLBACK_URL}")
+        
+        # Exchange code for tokens
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [OAUTH_CALLBACK_URL]
+                }
+            },
+            scopes=SCOPES
+        )
+        flow.redirect_uri = OAUTH_CALLBACK_URL
+        
+        logger.info("Exchanging authorization code for tokens...")
+        
+        try:
+            flow.fetch_token(code=code)
+            credentials = flow.credentials
+            logger.info("✅ Token exchange successful")
+            logger.info(f"Access token received: {credentials.token[:20]}...")
+            logger.info(f"Refresh token: {'Yes' if credentials.refresh_token else 'No'}")
+            
+        except Exception as token_error:
+            logger.error(f"❌ Token exchange failed: {str(token_error)}", exc_info=True)
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=token_exchange_failed"
+            )
+        
+        # Verify ID token and get user info
+        logger.info("Verifying ID token...")
+        
+        try:
+            from google.oauth2 import id_token
+            from google.auth.transport import requests as google_requests
+            
+            id_info = id_token.verify_oauth2_token(
+                credentials.id_token,
+                google_requests.Request(),
+                GOOGLE_CLIENT_ID
+            )
+            
+            google_id = id_info['sub']
+            email = id_info['email']
+            name = id_info.get('name', email)
+            picture = id_info.get('picture', '')
+            
+            logger.info(f"✅ User verified: {email}")
+            logger.info(f"Google ID: {google_id}")
+            logger.info(f"Name: {name}")
+            
+        except Exception as verify_error:
+            logger.error(f"❌ ID token verification failed: {str(verify_error)}", exc_info=True)
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=verification_failed"
+            )
+        
+        # Create or update user in database
+        logger.info("Checking database for existing user...")
+        
+        try:
+            existing_user = await db.users.find_one({"google_id": google_id})
+            
+            if existing_user:
+                # Update existing user
+                await db.users.update_one(
+                    {"google_id": google_id},
+                    {"$set": {
+                        "access_token": credentials.token,
+                        "refresh_token": credentials.refresh_token,
+                        "picture": picture,
+                        "name": name
+                    }}
+                )
+                user_id = existing_user['id']
+                logger.info(f"✅ Updated existing user: {user_id}")
+            else:
+                # Create new user
+                user = User(
+                    google_id=google_id,
+                    email=email,
+                    name=name,
+                    picture=picture,
+                    access_token=credentials.token,
+                    refresh_token=credentials.refresh_token
+                )
+                await db.users.insert_one(user.dict())
+                user_id = user.id
+                logger.info(f"✅ Created new user: {user_id}")
+        
+        except Exception as db_error:
+            logger.error(f"❌ Database error: {str(db_error)}", exc_info=True)
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=database_error"
+            )
+        
+        # Create session
+        logger.info("Creating session...")
+        
+        try:
+            request.session['user_id'] = user_id
+            request.session['email'] = email
+            logger.info(f"✅ Session created successfully")
+            logger.info(f"Session data: user_id={user_id}, email={email}")
+            
+        except Exception as session_error:
+            logger.error(f"❌ Session creation failed: {str(session_error)}", exc_info=True)
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/auth/login?error=session_error"
+            )
+        
+        # Success! Redirect to frontend
+        logger.info(f"✅ OAuth flow completed successfully")
+        logger.info(f"Redirecting to: {FRONTEND_URL}")
+        logger.info("=" * 80)
+        
+        return RedirectResponse(url=FRONTEND_URL)
+        
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error(f"❌ UNEXPECTED ERROR in callback: {str(e)}")
+        logger.error("=" * 80, exc_info=True)
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/auth/login?error=unexpected_error&message={str(e)}"
+        )
         
         credentials = flow.credentials
         logger.info("Token fetched successfully")
