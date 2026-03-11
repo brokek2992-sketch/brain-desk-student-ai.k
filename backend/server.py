@@ -196,8 +196,8 @@ async def health_check():
 
 # ==================== OAuth Configuration ====================
 
-# Canonical URLs - DO NOT CHANGE
-OAUTH_CALLBACK_URL = "https://brain-desk-1.cluster-1.preview.emergentcf.cloud/api/auth/callback"
+# Canonical URLs - Using the working emergentagent.com domain
+OAUTH_CALLBACK_URL = "https://brain-desk-1.preview.emergentagent.com/api/auth/callback"
 FRONTEND_URL = "https://brain-desk-1.preview.emergentagent.com"
 
 # In-memory state storage (use Redis in production)
