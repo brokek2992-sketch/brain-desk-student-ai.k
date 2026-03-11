@@ -1494,6 +1494,292 @@ async def get_sync_stats(user: User = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@api_router.get("/sync/email")
+async def sync_email(user: User = Depends(get_current_user)):
+    """Sync academic emails and extract attachments"""
+    try:
+        creds = get_google_credentials(user)
+        gmail_service = build('gmail', 'v1', credentials=creds)
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        logger.info(f"Starting email sync for user: {user.email}")
+        
+        # Get user's courses for mapping
+        courses = await db.courses.find({"user_id": user.id}).to_list(100)
+        course_names = [c['name'].lower() for c in courses]
+        course_map = {c['name'].lower(): c['id'] for c in courses}
+        
+        # Query for academic emails with attachments
+        query = 'has:attachment newer_than:30d'
+        
+        results = gmail_service.users().messages().list(
+            userId='me',
+            q=query,
+            maxResults=50
+        ).execute()
+        
+        messages = results.get('messages', [])
+        logger.info(f"Found {len(messages)} emails with attachments")
+        
+        synced_attachments = 0
+        synced_updates = 0
+        unsorted_count = 0
+        
+        for msg_ref in messages:
+            try:
+                # Get full message
+                message = gmail_service.users().messages().get(
+                    userId='me',
+                    id=msg_ref['id'],
+                    format='full'
+                ).execute()
+                
+                # Extract headers
+                headers = message['payload']['headers']
+                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+                sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+                date_str = next((h['value'] for h in headers if h['name'] == 'Date'), '')
+                
+                # Parse date
+                from email.utils import parsedate_to_datetime
+                received_date = parsedate_to_datetime(date_str) if date_str else datetime.utcnow()
+                
+                # Check if academic
+                academic_keywords = ['assignment', 'lecture', 'class', 'exam', 'submission', 'syllabus', 'notes']
+                is_academic = any(kw in subject.lower() for kw in academic_keywords) or '@atlasskilltech' in sender
+                
+                if not is_academic:
+                    continue
+                
+                logger.info(f"Processing email: {subject[:50]}...")
+                
+                # Check for attachments
+                parts = message['payload'].get('parts', [])
+                
+                def get_attachments(parts):
+                    attachments = []
+                    for part in parts:
+                        if part.get('filename'):
+                            attachments.append(part)
+                        if part.get('parts'):
+                            attachments.extend(get_attachments(part['parts']))
+                    return attachments
+                
+                attachments = get_attachments(parts)
+                
+                if not attachments:
+                    continue
+                
+                # Try to map to course
+                mapped_course_id = None
+                confidence = 0.0
+                
+                # Simple keyword matching
+                for course_name in course_names:
+                    if course_name in subject.lower():
+                        mapped_course_id = course_map[course_name]
+                        confidence = 0.9
+                        break
+                
+                # Determine category
+                is_circular = 'circular' in subject.lower() or 'announcement' in subject.lower()
+                is_exam = 'exam' in subject.lower() or 'test' in subject.lower()
+                is_timetable = 'timetable' in subject.lower() or 'schedule' in subject.lower()
+                
+                # Process attachments
+                for attachment in attachments[:3]:  # Limit to 3 per email
+                    filename = attachment['filename']
+                    
+                    if not any(filename.lower().endswith(ext) for ext in ['.pdf', '.docx', '.pptx', '.doc', '.ppt']):
+                        continue
+                    
+                    try:
+                        # Get attachment data
+                        att_id = attachment['body'].get('attachmentId')
+                        if not att_id:
+                            continue
+                        
+                        att_data = gmail_service.users().messages().attachments().get(
+                            userId='me',
+                            messageId=msg_ref['id'],
+                            id=att_id
+                        ).execute()
+                        
+                        file_data = base64.urlsafe_b64decode(att_data['data'])
+                        
+                        # Extract text
+                        text_content = ""
+                        if filename.lower().endswith('.pdf'):
+                            text_content = await extract_text_from_pdf(file_data)
+                        elif filename.lower().endswith('.docx'):
+                            text_content = await extract_text_from_docx(file_data)
+                        
+                        # Determine final category
+                        if is_circular or is_exam or is_timetable:
+                            # Store as university update
+                            update = UniversityUpdate(
+                                user_id=user.id,
+                                title=subject,
+                                sender=sender,
+                                received_date=received_date,
+                                summary=subject,
+                                category='exam' if is_exam else 'timetable' if is_timetable else 'general',
+                                attachments=[{
+                                    'filename': filename,
+                                    'size': len(file_data)
+                                }],
+                                email_id=msg_ref['id'],
+                                body_text=text_content[:500]
+                            )
+                            
+                            existing = await db.university_updates.find_one({
+                                "email_id": msg_ref['id'],
+                                "user_id": user.id
+                            })
+                            
+                            if not existing:
+                                await db.university_updates.insert_one(update.dict())
+                                synced_updates += 1
+                                logger.info(f"✅ Saved university update: {subject[:50]}")
+                        
+                        # Store as email attachment
+                        email_att = EmailAttachment(
+                            user_id=user.id,
+                            course_id=mapped_course_id,
+                            email_id=msg_ref['id'],
+                            subject=subject,
+                            sender=sender,
+                            received_date=received_date,
+                            file_name=filename,
+                            file_type='PDF' if filename.lower().endswith('.pdf') else 'Document',
+                            content=text_content[:10000] if text_content else "",
+                            category='course_material' if mapped_course_id else 'unsorted',
+                            confidence=confidence,
+                            source='email'
+                        )
+                        
+                        existing_att = await db.email_attachments.find_one({
+                            "email_id": msg_ref['id'],
+                            "file_name": filename,
+                            "user_id": user.id
+                        })
+                        
+                        if not existing_att:
+                            await db.email_attachments.insert_one(email_att.dict())
+                            
+                            # Also create as Note if mapped to course
+                            if mapped_course_id and text_content:
+                                note = Note(
+                                    user_id=user.id,
+                                    course_id=mapped_course_id,
+                                    title=filename,
+                                    content=text_content[:10000],
+                                    attachments=[{
+                                        'type': 'email',
+                                        'email_id': msg_ref['id'],
+                                        'sender': sender,
+                                        'subject': subject
+                                    }]
+                                )
+                                
+                                await db.notes.insert_one(note.dict())
+                            
+                            synced_attachments += 1
+                            
+                            if not mapped_course_id:
+                                unsorted_count += 1
+                            
+                            logger.info(f"✅ Saved attachment: {filename} ({'mapped' if mapped_course_id else 'unsorted'})")
+                    
+                    except Exception as att_error:
+                        logger.error(f"Error processing attachment {filename}: {str(att_error)}")
+            
+            except Exception as msg_error:
+                logger.error(f"Error processing message: {str(msg_error)}")
+        
+        logger.info(f"Email sync complete: {synced_attachments} attachments, {synced_updates} updates, {unsorted_count} unsorted")
+        
+        return {
+            "message": "Email sync completed",
+            "attachments_synced": synced_attachments,
+            "updates_synced": synced_updates,
+            "unsorted_count": unsorted_count
+        }
+    
+    except Exception as e:
+        logger.error(f"Error syncing email: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/updates/university")
+async def get_university_updates(
+    category: str = None,
+    user: User = Depends(get_current_user)
+):
+    """Get university updates/circulars"""
+    try:
+        query = {"user_id": user.id}
+        if category and category != 'all':
+            query["category"] = category
+        
+        updates = await db.university_updates.find(query).sort("received_date", -1).to_list(100)
+        
+        return {
+            "total": len(updates),
+            "updates": [UniversityUpdate(**u) for u in updates]
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting updates: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/email/unsorted")
+async def get_unsorted_files(user: User = Depends(get_current_user)):
+    """Get unsorted academic files from email"""
+    try:
+        unsorted = await db.email_attachments.find({
+            "user_id": user.id,
+            "category": "unsorted"
+        }).sort("received_date", -1).to_list(100)
+        
+        return {
+            "total": len(unsorted),
+            "files": [EmailAttachment(**f) for f in unsorted]
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting unsorted files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.patch("/email/attachment/{attachment_id}/map")
+async def map_attachment_to_course(
+    attachment_id: str,
+    course_id: str,
+    user: User = Depends(get_current_user)
+):
+    """Manually map an email attachment to a course"""
+    try:
+        result = await db.email_attachments.update_one(
+            {"id": attachment_id, "user_id": user.id},
+            {"$set": {
+                "course_id": course_id,
+                "category": "course_material",
+                "confidence": 1.0
+            }}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        
+        return {"message": "Attachment mapped successfully"}
+    
+    except Exception as e:
+        logger.error(f"Error mapping attachment: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @api_router.get("/dashboard")
 async def get_dashboard(user: User = Depends(get_current_user)):
     """Get dashboard data"""
