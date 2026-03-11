@@ -953,32 +953,64 @@ async def get_courses(user: User = Depends(get_current_user)):
 
 @api_router.get("/courses/{course_id}/files")
 async def get_course_files(course_id: str, user: User = Depends(get_current_user)):
-    """Get all files/notes for a specific course"""
+    """Get all files/notes for a specific course from ALL sources"""
     try:
-        # Get all notes for this course
-        notes = await db.notes.find({
+        # Get notes from Classroom/Drive
+        classroom_notes = await db.notes.find({
             "user_id": user.id,
             "course_id": course_id
         }).sort("created_at", -1).to_list(1000)
         
+        # Get notes from Email
+        email_notes = await db.email_attachments.find({
+            "user_id": user.id,
+            "course_id": course_id
+        }).sort("received_date", -1).to_list(1000)
+        
         files = []
-        for note in notes:
+        
+        # Add classroom/drive files
+        for note in classroom_notes:
             file_info = {
                 "id": note['id'],
                 "title": note['title'],
                 "content": note['content'],
                 "created_at": note['created_at'],
                 "updated_at": note['updated_at'],
-                "attachments": note.get('attachments', []),
+                "source": "classroom",
                 "content_preview": note['content'][:200] + "..." if len(note['content']) > 200 else note['content'],
                 "content_length": len(note['content']),
-                "file_type": "PDF" if note['title'].lower().endswith('.pdf') else "Document"
+                "file_type": "PDF" if note['title'].lower().endswith('.pdf') else "Document",
+                "has_content": len(note['content']) > 0
             }
             files.append(file_info)
+        
+        # Add email files
+        for email_note in email_notes:
+            file_info = {
+                "id": email_note['id'],
+                "title": email_note['file_name'],
+                "content": email_note['content'],
+                "created_at": email_note['received_date'],
+                "updated_at": email_note['received_date'],
+                "source": "email",
+                "sender": email_note.get('sender', ''),
+                "subject": email_note.get('subject', ''),
+                "content_preview": email_note['content'][:200] + "..." if len(email_note['content']) > 200 else email_note['content'],
+                "content_length": len(email_note['content']),
+                "file_type": email_note.get('file_type', 'Document'),
+                "has_content": len(email_note['content']) > 0
+            }
+            files.append(file_info)
+        
+        # Sort by date
+        files.sort(key=lambda x: x['created_at'], reverse=True)
         
         return {
             "course_id": course_id,
             "total_files": len(files),
+            "classroom_files": len(classroom_notes),
+            "email_files": len(email_notes),
             "files": files
         }
     
@@ -1273,40 +1305,97 @@ async def chat(request: ChatRequest, user: User = Depends(get_current_user)):
         
         logger.info(f"Chat request from {user.email}: {request.message[:50]}...")
         
+        # Try to identify course from message
+        user_message_lower = request.message.lower()
+        
+        # Get all user's courses
+        courses = await db.courses.find({"user_id": user.id}).to_list(100)
+        
+        identified_course_id = request.course_id
+        identified_course_name = None
+        
+        # Try to match course from message if not explicitly provided
+        if not identified_course_id:
+            for course in courses:
+                course_name_lower = course['name'].lower()
+                # Check for course name mentions
+                if course_name_lower in user_message_lower or any(
+                    keyword in user_message_lower 
+                    for keyword in course_name_lower.split()
+                    if len(keyword) > 3
+                ):
+                    identified_course_id = course['id']
+                    identified_course_name = course['name']
+                    logger.info(f"Identified course from message: {course['name']}")
+                    break
+        else:
+            # Get course name
+            for course in courses:
+                if course['id'] == identified_course_id:
+                    identified_course_name = course['name']
+                    break
+        
         # Get relevant notes for context
         query = {"user_id": user.id}
-        if request.course_id:
-            query["course_id"] = request.course_id
-            logger.info(f"Filtering notes by course: {request.course_id}")
+        if identified_course_id:
+            query["course_id"] = identified_course_id
+            logger.info(f"Filtering notes by course: {identified_course_id}")
         
+        # Get notes from classroom/drive
         notes = await db.notes.find(query).to_list(100)
         
-        logger.info(f"Retrieved {len(notes)} notes for context")
+        # Get notes from email
+        email_notes = await db.email_attachments.find(query).to_list(50) if identified_course_id else []
+        
+        total_notes = len(notes) + len(email_notes)
+        
+        logger.info(f"Retrieved {len(notes)} classroom notes + {len(email_notes)} email notes = {total_notes} total")
         
         # Build context from notes with better formatting
-        if notes:
-            context = "=== STUDENT'S COURSE MATERIALS ===\n\n"
+        if total_notes > 0:
+            context = f"=== STUDENT'S COURSE MATERIALS FOR {identified_course_name.upper() if identified_course_name else 'ALL COURSES'} ===\n\n"
+            
             for note in notes:
-                context += f"📄 {note['title']}\n"
-                context += f"{note['content'][:2000]}\n"  # Limit each note
+                context += f"📄 {note['title']} (Source: Classroom)\n"
+                context += f"{note['content'][:2000]}\n"
+                context += "\n" + "="*50 + "\n\n"
+            
+            for email_note in email_notes:
+                context += f"📧 {email_note['file_name']} (Source: Email from {email_note.get('sender', 'Unknown')})\n"
+                context += f"{email_note['content'][:2000]}\n"
                 context += "\n" + "="*50 + "\n\n"
             
             context += "\n=== END OF MATERIALS ===\n"
         else:
-            context = "No course materials have been synced yet. Please sync your Google Classroom first.\n"
+            if identified_course_name:
+                context = f"No files have been synced yet for {identified_course_name} course. The student should sync their Google Classroom or email to get course materials.\n"
+            else:
+                context = "No course materials have been synced yet. Please sync your Google Classroom first.\n"
         
         # Create chat with context
-        system_message = f"""You are a helpful AI tutor assistant for a student.
+        if total_notes > 0:
+            system_message = f"""You are a helpful AI tutor assistant for a student.
 
 IMPORTANT: The student has shared their course materials with you below. When answering questions:
 1. ALWAYS search through the provided materials first
 2. If the answer is in the materials, cite which document it came from
 3. If the answer is NOT in the materials, clearly state that and provide general educational guidance
 4. Be specific and reference the actual content from their notes
+5. If they ask about a specific course and you have materials for it, use those materials
+
+The student asked: "{request.message}"
 
 {context}
 
-Now help the student with their question."""
+Now help the student with their question using the materials above."""
+        else:
+            system_message = f"""You are a helpful AI tutor assistant for a student.
+
+The student asked: "{request.message}"
+
+{context}
+
+Since no course materials are available, let them know they need to sync their materials first."""
         
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
@@ -1315,8 +1404,8 @@ Now help the student with their question."""
         )
         chat.with_model("openai", "gpt-4o")
         
-        user_message = UserMessage(text=request.message)
-        response = await chat.send_message(user_message)
+        user_message_obj = UserMessage(text=request.message)
+        response = await chat.send_message(user_message_obj)
         
         # Save chat messages
         user_msg = ChatMessage(
@@ -1335,12 +1424,13 @@ Now help the student with their question."""
         await db.chat_messages.insert_one(user_msg.dict())
         await db.chat_messages.insert_one(assistant_msg.dict())
         
-        logger.info(f"Chat response generated ({len(response)} chars)")
+        logger.info(f"Chat response generated ({len(response)} chars) using {total_notes} files")
         
         return {
             "session_id": session_id,
             "response": response,
-            "notes_used": len(notes)
+            "notes_used": total_notes,
+            "course_identified": identified_course_name
         }
     
     except Exception as e:
