@@ -8,6 +8,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 import os
 import logging
@@ -606,24 +607,32 @@ async def logout(request: Request):
 
 @api_router.get("/sync/classroom")
 async def sync_classroom(user: User = Depends(get_current_user)):
-    """Sync courses and assignments from Google Classroom"""
+    """Sync courses, assignments, AND materials from Google Classroom"""
     try:
         creds = get_google_credentials(user)
-        service = build('classroom', 'v1', credentials=creds)
+        classroom_service = build('classroom', 'v1', credentials=creds)
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        logger.info(f"Starting Classroom sync for user: {user.email}")
         
         # Fetch courses
-        results = service.courses().list(pageSize=100).execute()
+        results = classroom_service.courses().list(pageSize=100).execute()
         courses = results.get('courses', [])
         
         synced_courses = []
         synced_assignments = []
+        synced_notes = 0
         
         for course in courses:
             course_id = course['id']
+            course_name = course.get('name', 'Untitled Course')
+            
+            logger.info(f"Processing course: {course_name}")
+            
             course_data = Course(
                 user_id=user.id,
                 classroom_id=course_id,
-                name=course.get('name', 'Untitled Course'),
+                name=course_name,
                 section=course.get('section', ''),
                 description=course.get('descriptionHeading', ''),
                 teacher_name=course.get('ownerId', ''),
@@ -641,19 +650,24 @@ async def sync_classroom(user: User = Depends(get_current_user)):
                     {"user_id": user.id, "classroom_id": course_id},
                     {"$set": course_data.dict()}
                 )
+                db_course_id = existing_course['id']
             else:
                 await db.courses.insert_one(course_data.dict())
+                db_course_id = course_data.id
             
             synced_courses.append(course_data)
             
-            # Fetch coursework (assignments)
+            # Fetch coursework (assignments) with materials
             try:
-                coursework_results = service.courses().courseWork().list(
+                coursework_results = classroom_service.courses().courseWork().list(
                     courseId=course_id
                 ).execute()
                 coursework_items = coursework_results.get('courseWork', [])
                 
+                logger.info(f"Found {len(coursework_items)} coursework items in {course_name}")
+                
                 for item in coursework_items:
+                    # Save assignment
                     due_date = None
                     if 'dueDate' in item:
                         due_date_data = item['dueDate']
@@ -665,7 +679,7 @@ async def sync_classroom(user: User = Depends(get_current_user)):
                     
                     assignment_data = Assignment(
                         user_id=user.id,
-                        course_id=course_data.id,
+                        course_id=db_course_id,
                         classroom_id=course_id,
                         title=item.get('title', 'Untitled Assignment'),
                         description=item.get('description', ''),
@@ -683,18 +697,169 @@ async def sync_classroom(user: User = Depends(get_current_user)):
                     if not existing_assignment:
                         await db.assignments.insert_one(assignment_data.dict())
                         synced_assignments.append(assignment_data)
+                    
+                    # Process materials/attachments
+                    materials = item.get('materials', [])
+                    
+                    for material in materials:
+                        # Check for Drive files
+                        if 'driveFile' in material:
+                            drive_file = material['driveFile']['driveFile']
+                            file_id = drive_file['id']
+                            file_title = drive_file.get('title', 'Untitled File')
+                            
+                            logger.info(f"Processing Drive file: {file_title}")
+                            
+                            # Download and process PDF
+                            if file_title.lower().endswith('.pdf'):
+                                try:
+                                    # Download PDF content
+                                    request = drive_service.files().get_media(fileId=file_id)
+                                    file_content = io.BytesIO()
+                                    downloader = MediaIoBaseDownload(file_content, request)
+                                    
+                                    done = False
+                                    while not done:
+                                        status, done = downloader.next_chunk()
+                                    
+                                    file_content.seek(0)
+                                    
+                                    # Extract text from PDF
+                                    pdf_text = await extract_text_from_pdf(file_content.read())
+                                    
+                                    if pdf_text:
+                                        # Save as note
+                                        note = Note(
+                                            user_id=user.id,
+                                            course_id=db_course_id,
+                                            title=file_title,
+                                            content=pdf_text[:10000],  # Limit size
+                                            attachments=[{
+                                                'type': 'drive_file',
+                                                'file_id': file_id,
+                                                'title': file_title
+                                            }]
+                                        )
+                                        
+                                        # Check if note already exists
+                                        existing_note = await db.notes.find_one({
+                                            "user_id": user.id,
+                                            "course_id": db_course_id,
+                                            "title": file_title
+                                        })
+                                        
+                                        if not existing_note:
+                                            await db.notes.insert_one(note.dict())
+                                            synced_notes += 1
+                                            logger.info(f"✅ Saved PDF note: {file_title} ({len(pdf_text)} chars)")
+                                
+                                except Exception as pdf_error:
+                                    logger.error(f"Error processing PDF {file_title}: {str(pdf_error)}")
+                        
+                        # Check for links
+                        elif 'link' in material:
+                            link_url = material['link'].get('url', '')
+                            link_title = material['link'].get('title', 'Link')
+                            
+                            # Save link as note
+                            note = Note(
+                                user_id=user.id,
+                                course_id=db_course_id,
+                                title=link_title,
+                                content=f"Link: {link_url}",
+                                attachments=[{
+                                    'type': 'link',
+                                    'url': link_url,
+                                    'title': link_title
+                                }]
+                            )
+                            
+                            existing_note = await db.notes.find_one({
+                                "user_id": user.id,
+                                "course_id": db_course_id,
+                                "title": link_title
+                            })
+                            
+                            if not existing_note:
+                                await db.notes.insert_one(note.dict())
+                                synced_notes += 1
             
             except HttpError as e:
                 logger.warning(f"Could not fetch coursework for {course_id}: {str(e)}")
+            
+            # Fetch course materials
+            try:
+                materials_results = classroom_service.courses().courseWorkMaterials().list(
+                    courseId=course_id
+                ).execute()
+                materials_items = materials_results.get('courseWorkMaterial', [])
+                
+                logger.info(f"Found {len(materials_items)} course materials in {course_name}")
+                
+                for material_item in materials_items:
+                    materials = material_item.get('materials', [])
+                    
+                    for material in materials:
+                        if 'driveFile' in material:
+                            drive_file = material['driveFile']['driveFile']
+                            file_id = drive_file['id']
+                            file_title = drive_file.get('title', 'Untitled File')
+                            
+                            # Download PDF
+                            if file_title.lower().endswith('.pdf'):
+                                try:
+                                    request = drive_service.files().get_media(fileId=file_id)
+                                    file_content = io.BytesIO()
+                                    downloader = MediaIoBaseDownload(file_content, request)
+                                    
+                                    done = False
+                                    while not done:
+                                        status, done = downloader.next_chunk()
+                                    
+                                    file_content.seek(0)
+                                    pdf_text = await extract_text_from_pdf(file_content.read())
+                                    
+                                    if pdf_text:
+                                        note = Note(
+                                            user_id=user.id,
+                                            course_id=db_course_id,
+                                            title=file_title,
+                                            content=pdf_text[:10000],
+                                            attachments=[{
+                                                'type': 'drive_file',
+                                                'file_id': file_id,
+                                                'title': file_title
+                                            }]
+                                        )
+                                        
+                                        existing_note = await db.notes.find_one({
+                                            "user_id": user.id,
+                                            "course_id": db_course_id,
+                                            "title": file_title
+                                        })
+                                        
+                                        if not existing_note:
+                                            await db.notes.insert_one(note.dict())
+                                            synced_notes += 1
+                                            logger.info(f"✅ Saved material: {file_title}")
+                                
+                                except Exception as e:
+                                    logger.error(f"Error processing material {file_title}: {str(e)}")
+            
+            except HttpError as e:
+                logger.warning(f"Could not fetch materials for {course_id}: {str(e)}")
+        
+        logger.info(f"Sync complete: {len(synced_courses)} courses, {len(synced_assignments)} assignments, {synced_notes} notes")
         
         return {
             "message": "Sync completed",
             "courses_synced": len(synced_courses),
-            "assignments_synced": len(synced_assignments)
+            "assignments_synced": len(synced_assignments),
+            "notes_synced": synced_notes
         }
     
     except Exception as e:
-        logger.error(f"Error syncing classroom: {str(e)}")
+        logger.error(f"Error syncing classroom: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== Courses Routes ====================
@@ -822,28 +987,46 @@ async def delete_note(note_id: str, user: User = Depends(get_current_user)):
 
 @api_router.post("/chat")
 async def chat(request: ChatRequest, user: User = Depends(get_current_user)):
-    """Chat with AI tutor"""
+    """Chat with AI tutor using retrieved notes"""
     try:
         session_id = request.session_id or str(uuid.uuid4())
+        
+        logger.info(f"Chat request from {user.email}: {request.message[:50]}...")
         
         # Get relevant notes for context
         query = {"user_id": user.id}
         if request.course_id:
             query["course_id"] = request.course_id
+            logger.info(f"Filtering notes by course: {request.course_id}")
         
         notes = await db.notes.find(query).to_list(100)
         
-        # Build context from notes
-        context = "Here are the student's notes:\n\n"
-        for note in notes:
-            context += f"Title: {note['title']}\n{note['content']}\n\n"
+        logger.info(f"Retrieved {len(notes)} notes for context")
+        
+        # Build context from notes with better formatting
+        if notes:
+            context = "=== STUDENT'S COURSE MATERIALS ===\n\n"
+            for note in notes:
+                context += f"📄 {note['title']}\n"
+                context += f"{note['content'][:2000]}\n"  # Limit each note
+                context += "\n" + "="*50 + "\n\n"
+            
+            context += "\n=== END OF MATERIALS ===\n"
+        else:
+            context = "No course materials have been synced yet. Please sync your Google Classroom first.\n"
         
         # Create chat with context
-        system_message = f"""You are a helpful AI tutor assistant for students. You help them understand concepts, generate quizzes, and study better.
-        
+        system_message = f"""You are a helpful AI tutor assistant for a student.
+
+IMPORTANT: The student has shared their course materials with you below. When answering questions:
+1. ALWAYS search through the provided materials first
+2. If the answer is in the materials, cite which document it came from
+3. If the answer is NOT in the materials, clearly state that and provide general educational guidance
+4. Be specific and reference the actual content from their notes
+
 {context}
 
-Use the above notes to answer questions accurately. If the information isn't in the notes, provide general educational help."""
+Now help the student with their question."""
         
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
@@ -872,13 +1055,16 @@ Use the above notes to answer questions accurately. If the information isn't in 
         await db.chat_messages.insert_one(user_msg.dict())
         await db.chat_messages.insert_one(assistant_msg.dict())
         
+        logger.info(f"Chat response generated ({len(response)} chars)")
+        
         return {
             "session_id": session_id,
-            "response": response
+            "response": response,
+            "notes_used": len(notes)
         }
     
     except Exception as e:
-        logger.error(f"Error in chat: {str(e)}")
+        logger.error(f"Error in chat: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/chat/history/{session_id}")
@@ -973,6 +1159,60 @@ async def get_quiz(quiz_id: str, user: User = Depends(get_current_user)):
     return Quiz(**quiz)
 
 # ==================== Dashboard Routes ====================
+
+@api_router.get("/sync/stats")
+async def get_sync_stats(user: User = Depends(get_current_user)):
+    """Get statistics about synced data"""
+    try:
+        # Get all courses
+        courses = await db.courses.find({"user_id": user.id}).to_list(100)
+        
+        stats = {
+            "total_courses": len(courses),
+            "total_notes": 0,
+            "total_assignments": 0,
+            "courses_detail": []
+        }
+        
+        for course in courses:
+            notes_count = await db.notes.count_documents({
+                "user_id": user.id,
+                "course_id": course['id']
+            })
+            
+            assignments_count = await db.assignments.count_documents({
+                "user_id": user.id,
+                "course_id": course['id']
+            })
+            
+            # Get sample notes
+            sample_notes = await db.notes.find({
+                "user_id": user.id,
+                "course_id": course['id']
+            }).limit(3).to_list(3)
+            
+            stats["total_notes"] += notes_count
+            stats["total_assignments"] += assignments_count
+            
+            stats["courses_detail"].append({
+                "name": course['name'],
+                "notes_count": notes_count,
+                "assignments_count": assignments_count,
+                "sample_notes": [
+                    {
+                        "title": note['title'],
+                        "content_preview": note['content'][:200] + "..."
+                    }
+                    for note in sample_notes
+                ]
+            })
+        
+        return stats
+    
+    except Exception as e:
+        logger.error(f"Error getting sync stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @api_router.get("/dashboard")
 async def get_dashboard(user: User = Depends(get_current_user)):
