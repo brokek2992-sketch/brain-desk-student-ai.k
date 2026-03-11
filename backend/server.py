@@ -226,7 +226,7 @@ async def login(request: Request):
             'redirect_uri': OAUTH_CALLBACK_URL
         }
         
-        # Build Google OAuth flow
+        # Build Google OAuth flow (disable PKCE)
         flow = Flow.from_client_config(
             {
                 "web": {
@@ -241,7 +241,10 @@ async def login(request: Request):
         )
         flow.redirect_uri = OAUTH_CALLBACK_URL
         
-        # Generate authorization URL
+        # Disable PKCE by removing code_verifier
+        flow.code_verifier = None
+        
+        # Generate authorization URL without PKCE
         authorization_url, _ = flow.authorization_url(
             access_type='offline',
             include_granted_scopes='true',
@@ -328,7 +331,7 @@ async def auth_callback(
         logger.info(f"Using Client ID: {GOOGLE_CLIENT_ID[:20]}...")
         logger.info(f"Using redirect_uri: {OAUTH_CALLBACK_URL}")
         
-        # Exchange code for tokens
+        # Exchange code for tokens (disable PKCE)
         flow = Flow.from_client_config(
             {
                 "web": {
@@ -342,6 +345,7 @@ async def auth_callback(
             scopes=SCOPES
         )
         flow.redirect_uri = OAUTH_CALLBACK_URL
+        flow.code_verifier = None  # Disable PKCE
         
         logger.info("Exchanging authorization code for tokens...")
         
