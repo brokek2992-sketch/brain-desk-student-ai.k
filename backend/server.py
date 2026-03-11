@@ -21,6 +21,8 @@ from bson import ObjectId
 import json
 import io
 import base64
+import zipfile
+import tempfile
 from PyPDF2 import PdfReader
 
 ROOT_DIR = Path(__file__).parent
@@ -890,6 +892,226 @@ async def get_courses(user: User = Depends(get_current_user)):
         })
     
     return result
+
+@api_router.get("/courses/{course_id}/files")
+async def get_course_files(course_id: str, user: User = Depends(get_current_user)):
+    """Get all files/notes for a specific course"""
+    try:
+        # Get all notes for this course
+        notes = await db.notes.find({
+            "user_id": user.id,
+            "course_id": course_id
+        }).sort("created_at", -1).to_list(1000)
+        
+        files = []
+        for note in notes:
+            file_info = {
+                "id": note['id'],
+                "title": note['title'],
+                "content": note['content'],
+                "created_at": note['created_at'],
+                "updated_at": note['updated_at'],
+                "attachments": note.get('attachments', []),
+                "content_preview": note['content'][:200] + "..." if len(note['content']) > 200 else note['content'],
+                "content_length": len(note['content']),
+                "file_type": "PDF" if note['title'].lower().endswith('.pdf') else "Document"
+            }
+            files.append(file_info)
+        
+        return {
+            "course_id": course_id,
+            "total_files": len(files),
+            "files": files
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting course files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/courses/{course_id}/download")
+async def download_course_files(course_id: str, user: User = Depends(get_current_user)):
+    """Download all files for a course as ZIP"""
+    try:
+        from fastapi.responses import StreamingResponse
+        
+        # Get course info
+        course = await db.courses.find_one({"id": course_id, "user_id": user.id})
+        if not course:
+            raise HTTPException(status_code=404, detail="Course not found")
+        
+        course_name = course['name'].replace('/', '-').replace('\\', '-')
+        
+        # Get all notes for this course
+        notes = await db.notes.find({
+            "user_id": user.id,
+            "course_id": course_id
+        }).to_list(1000)
+        
+        # Create ZIP file in memory
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for note in notes:
+                # Create filename
+                filename = note['title']
+                if not filename.endswith('.txt') and not filename.endswith('.pdf'):
+                    filename += '.txt'
+                
+                # Add note content to ZIP
+                zip_file.writestr(filename, note['content'])
+        
+        zip_buffer.seek(0)
+        
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename={course_name}_files.zip"
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"Error downloading course files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/notes/download-all")
+async def download_all_notes(user: User = Depends(get_current_user)):
+    """Download all notes from all courses as structured ZIP"""
+    try:
+        from fastapi.responses import StreamingResponse
+        
+        # Get all courses
+        courses = await db.courses.find({"user_id": user.id}).to_list(100)
+        
+        # Create ZIP file in memory
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for course in courses:
+                course_name = course['name'].replace('/', '-').replace('\\', '-')
+                course_folder = f"BrainDesk_Notes/{course_name}/"
+                
+                # Get notes for this course
+                notes = await db.notes.find({
+                    "user_id": user.id,
+                    "course_id": course['id']
+                }).to_list(1000)
+                
+                for note in notes:
+                    filename = note['title']
+                    if not filename.endswith('.txt') and not filename.endswith('.pdf'):
+                        filename += '.txt'
+                    
+                    # Add to course folder
+                    zip_file.writestr(course_folder + filename, note['content'])
+        
+        zip_buffer.seek(0)
+        
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=BrainDesk_All_Notes.zip"
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"Error downloading all notes: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/calendar/events")
+async def get_calendar_events(
+    month: int = None,
+    year: int = None,
+    user: User = Depends(get_current_user)
+):
+    """Get calendar events (assignments and notes) for a specific month"""
+    try:
+        # Default to current month if not provided
+        if not month or not year:
+            now = datetime.utcnow()
+            month = now.month
+            year = now.year
+        
+        # Get start and end of month
+        start_date = datetime(year, month, 1)
+        if month == 12:
+            end_date = datetime(year + 1, 1, 1)
+        else:
+            end_date = datetime(year, month + 1, 1)
+        
+        # Get assignments for the month
+        assignments = await db.assignments.find({
+            "user_id": user.id,
+            "due_date": {
+                "$gte": start_date,
+                "$lt": end_date
+            }
+        }).to_list(1000)
+        
+        # Get notes created in the month
+        notes = await db.notes.find({
+            "user_id": user.id,
+            "created_at": {
+                "$gte": start_date,
+                "$lt": end_date
+            }
+        }).to_list(1000)
+        
+        # Get courses for context
+        course_ids = set([a['course_id'] for a in assignments] + [n.get('course_id') for n in notes if n.get('course_id')])
+        courses_map = {}
+        
+        for course_id in course_ids:
+            if course_id:
+                course = await db.courses.find_one({"id": course_id, "user_id": user.id})
+                if course:
+                    courses_map[course_id] = course['name']
+        
+        # Organize by date
+        events_by_date = {}
+        
+        # Add assignments
+        for assignment in assignments:
+            if assignment.get('due_date'):
+                date_key = assignment['due_date'].strftime('%Y-%m-%d')
+                if date_key not in events_by_date:
+                    events_by_date[date_key] = {"assignments": [], "notes": []}
+                
+                events_by_date[date_key]["assignments"].append({
+                    "id": assignment['id'],
+                    "title": assignment['title'],
+                    "course_name": courses_map.get(assignment['course_id'], 'Unknown'),
+                    "state": assignment.get('state', 'PENDING')
+                })
+        
+        # Add notes
+        for note in notes:
+            date_key = note['created_at'].strftime('%Y-%m-%d')
+            if date_key not in events_by_date:
+                events_by_date[date_key] = {"assignments": [], "notes": []}
+            
+            events_by_date[date_key]["notes"].append({
+                "id": note['id'],
+                "title": note['title'],
+                "course_name": courses_map.get(note.get('course_id'), 'Unknown'),
+            })
+        
+        return {
+            "month": month,
+            "year": year,
+            "events_by_date": events_by_date,
+            "total_assignments": len(assignments),
+            "total_notes": len(notes)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting calendar events: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @api_router.get("/courses/{course_id}")
 async def get_course(course_id: str, user: User = Depends(get_current_user)):
