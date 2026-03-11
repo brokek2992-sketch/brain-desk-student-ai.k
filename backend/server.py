@@ -443,12 +443,14 @@ async def auth_callback(
                 url=f"{FRONTEND_URL}/auth/login?error=session_error"
             )
         
-        # Success! Redirect to frontend
+        # Success! Redirect to frontend with user_id as query param
+        # Frontend will capture this and call /api/auth/me with credentials
         logger.info(f"✅ OAuth flow completed successfully")
-        logger.info(f"Redirecting to: {FRONTEND_URL}")
+        logger.info(f"Redirecting to: {FRONTEND_URL}?user_id={user_id}")
         logger.info("=" * 80)
         
-        return RedirectResponse(url=FRONTEND_URL)
+        # Redirect with user_id so frontend can fetch user data
+        return RedirectResponse(url=f"{FRONTEND_URL}?auth_success=true&user_id={user_id}")
         
     except Exception as e:
         logger.error("=" * 80)
@@ -574,6 +576,20 @@ async def auth_callback(
     # Redirect to frontend homepage
     frontend_url = "https://brain-desk-1.preview.emergentagent.com"
     return RedirectResponse(url=frontend_url)
+
+@api_router.get("/auth/user/{user_id}")
+async def get_user_by_id(user_id: str):
+    """Get user by ID (for post-OAuth frontend auth)"""
+    try:
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return User(**user)
+    except Exception as e:
+        logger.error(f"Error fetching user: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @api_router.get("/auth/me")
 async def get_me(user: User = Depends(get_current_user)):
