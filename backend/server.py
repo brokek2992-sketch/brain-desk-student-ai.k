@@ -1,5 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, UploadFile, File, Form
+from fastapi.responses import RedirectResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -24,6 +24,8 @@ import base64
 import zipfile
 import tempfile
 from PyPDF2 import PdfReader
+from PIL import Image
+import pytesseract
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -188,6 +190,29 @@ async def extract_text_from_pdf(pdf_content: bytes) -> str:
         return text
     except Exception as e:
         logger.error(f"Error extracting PDF text: {str(e)}")
+        return ""
+
+
+async def extract_text_from_image(image_bytes: bytes) -> str:
+    """Extract text from image using OCR"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        text = pytesseract.image_to_string(image)
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting text from image: {str(e)}")
+        return ""
+
+
+async def extract_text_from_docx(docx_bytes: bytes) -> str:
+    """Extract text from DOCX file"""
+    try:
+        import docx
+        doc = docx.Document(io.BytesIO(docx_bytes))
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting DOCX text: {str(e)}")
         return ""
 
 # ==================== Health Check Route ====================
