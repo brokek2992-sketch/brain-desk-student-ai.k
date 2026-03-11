@@ -331,30 +331,39 @@ async def auth_callback(
         logger.info(f"Using Client ID: {GOOGLE_CLIENT_ID[:20]}...")
         logger.info(f"Using redirect_uri: {OAUTH_CALLBACK_URL}")
         
-        # Exchange code for tokens (disable PKCE)
-        flow = Flow.from_client_config(
-            {
-                "web": {
-                    "client_id": GOOGLE_CLIENT_ID,
-                    "client_secret": GOOGLE_CLIENT_SECRET,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": [OAUTH_CALLBACK_URL]
-                }
-            },
-            scopes=SCOPES
-        )
-        flow.redirect_uri = OAUTH_CALLBACK_URL
-        flow.code_verifier = None  # Disable PKCE
+        # Exchange code for tokens (manual approach to avoid PKCE)
+        import requests
         
         logger.info("Exchanging authorization code for tokens...")
         
         try:
-            flow.fetch_token(code=code)
-            credentials = flow.credentials
+            # Manual token exchange to avoid PKCE
+            token_response = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": OAUTH_CALLBACK_URL,
+                    "grant_type": "authorization_code"
+                }
+            )
+            
+            if token_response.status_code != 200:
+                logger.error(f"Token exchange failed with status {token_response.status_code}")
+                logger.error(f"Response: {token_response.text}")
+                return RedirectResponse(
+                    url=f"{FRONTEND_URL}/auth/login?error=token_exchange_failed"
+                )
+            
+            token_data = token_response.json()
+            access_token = token_data.get("access_token")
+            refresh_token = token_data.get("refresh_token")
+            id_token_str = token_data.get("id_token")
+            
             logger.info("✅ Token exchange successful")
-            logger.info(f"Access token received: {credentials.token[:20]}...")
-            logger.info(f"Refresh token: {'Yes' if credentials.refresh_token else 'No'}")
+            logger.info(f"Access token received: {access_token[:20] if access_token else 'None'}...")
+            logger.info(f"Refresh token: {'Yes' if refresh_token else 'No'}")
             
         except Exception as token_error:
             logger.error(f"❌ Token exchange failed: {str(token_error)}", exc_info=True)
@@ -370,7 +379,7 @@ async def auth_callback(
             from google.auth.transport import requests as google_requests
             
             id_info = id_token.verify_oauth2_token(
-                credentials.id_token,
+                id_token_str,
                 google_requests.Request(),
                 GOOGLE_CLIENT_ID
             )
@@ -401,8 +410,8 @@ async def auth_callback(
                 await db.users.update_one(
                     {"google_id": google_id},
                     {"$set": {
-                        "access_token": credentials.token,
-                        "refresh_token": credentials.refresh_token,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
                         "picture": picture,
                         "name": name
                     }}
@@ -416,8 +425,8 @@ async def auth_callback(
                     email=email,
                     name=name,
                     picture=picture,
-                    access_token=credentials.token,
-                    refresh_token=credentials.refresh_token
+                    access_token=access_token,
+                    refresh_token=refresh_token
                 )
                 await db.users.insert_one(user.dict())
                 user_id = user.id
