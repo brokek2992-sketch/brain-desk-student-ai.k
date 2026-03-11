@@ -49,7 +49,8 @@ SCOPES = [
     'https://www.googleapis.com/auth/classroom.coursework.me.readonly',
     'https://www.googleapis.com/auth/classroom.coursework.students.readonly',
     'https://www.googleapis.com/auth/drive.readonly',
-    'https://www.googleapis.com/auth/calendar'
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/gmail.readonly',  # Add Gmail read access
 ]
 
 # Create the main app
@@ -133,6 +134,38 @@ class Quiz(BaseModel):
     title: str
     questions: List[QuizQuestion]
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class EmailAttachment(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    course_id: Optional[str] = None
+    email_id: str
+    subject: str
+    sender: str
+    received_date: datetime
+    file_name: str
+    file_type: str
+    content: str
+    category: str  # course_material, assignment, circular, exam, timetable, general
+    confidence: float  # 0.0 to 1.0
+    source: str = "email"
+    attachment_data: Optional[dict] = {}
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class UniversityUpdate(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    title: str
+    sender: str
+    received_date: datetime
+    summary: str
+    category: str  # academic, exam, administrative, fees, timetable, general
+    attachments: List[dict] = []
+    email_id: str
+    body_text: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
 
 # ==================== Request/Response Models ====================
 
