@@ -5,11 +5,10 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+import google.generativeai as genai
 import os
 import logging
 from pathlib import Path
@@ -17,18 +16,21 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 import uuid
 from datetime import datetime, timedelta
-from bson import ObjectId
 import json
 import io
 import base64
 import zipfile
-import tempfile
 from PyPDF2 import PdfReader
-from PIL import Image
-import pytesseract
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
@@ -38,7 +40,11 @@ db = client[os.environ.get('DB_NAME', 'brain_desk')]
 # Google OAuth Configuration
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', 'sk-emergent-4B0C38046991616673')
+
+# Gemini AI Configuration
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # SCOPES for Google APIs
 SCOPES = [
@@ -50,24 +56,32 @@ SCOPES = [
     'https://www.googleapis.com/auth/classroom.coursework.students.readonly',
     'https://www.googleapis.com/auth/drive.readonly',
     'https://www.googleapis.com/auth/calendar',
-    'https://www.googleapis.com/auth/gmail.readonly',  # Add Gmail read access
+    'https://www.googleapis.com/auth/gmail.readonly',
 ]
 
 # Create the main app
 app = FastAPI()
 
-# Add session middleware with proper cookie settings for HTTPS
+# Add session middleware
 app.add_middleware(
-    SessionMiddleware, 
-    secret_key=os.environ.get('SECRET_KEY', 'your-secret-key-here-change-in-production'),
+    SessionMiddleware,
+    secret_key=os.environ.get('SECRET_KEY', 'brain-desk-secret-key-change-in-prod'),
     session_cookie='brain_desk_session',
-    max_age=86400 * 7,  # 7 days
-    same_site='none',  # Allow cross-domain cookies
-    https_only=True  # Use HTTPS cookies
+    max_age=86400 * 7,
+    same_site='none',
+    https_only=True
 )
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
+
+# ==================== OAuth URLs ====================
+BACKEND_URL = os.environ.get('BACKEND_URL', 'https://brain-desk-backend.onrender.com')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://brain-desk-frontend.onrender.com')
+OAUTH_CALLBACK_URL = f"{BACKEND_URL}/api/auth/callback"
+
+# In-memory state storage
+oauth_states = {}
 
 # ==================== Models ====================
 
@@ -100,7 +114,7 @@ class Assignment(BaseModel):
     title: str
     description: Optional[str] = None
     due_date: Optional[datetime] = None
-    state: str = "PENDING"  # PENDING, COMPLETED
+    state: str = "PENDING"
     link: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -118,7 +132,7 @@ class ChatMessage(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     session_id: str
-    role: str  # "user" or "assistant"
+    role: str
     content: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
@@ -146,12 +160,11 @@ class EmailAttachment(BaseModel):
     file_name: str
     file_type: str
     content: str
-    category: str  # course_material, assignment, circular, exam, timetable, general
-    confidence: float  # 0.0 to 1.0
+    category: str
+    confidence: float
     source: str = "email"
     attachment_data: Optional[dict] = {}
     created_at: datetime = Field(default_factory=datetime.utcnow)
-
 
 class UniversityUpdate(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -160,12 +173,11 @@ class UniversityUpdate(BaseModel):
     sender: str
     received_date: datetime
     summary: str
-    category: str  # academic, exam, administrative, fees, timetable, general
+    category: str
     attachments: List[dict] = []
     email_id: str
     body_text: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
-
 
 # ==================== Request/Response Models ====================
 
@@ -191,17 +203,14 @@ async def get_current_user(request: Request):
     user_id = request.session.get('user_id')
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
     user = await db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    
     return User(**user)
 
 def get_google_credentials(user: User):
     if not user.access_token:
         raise HTTPException(status_code=401, detail="No Google credentials found")
-    
     creds = Credentials(
         token=user.access_token,
         refresh_token=user.refresh_token,
@@ -213,7 +222,6 @@ def get_google_credentials(user: User):
     return creds
 
 async def extract_text_from_pdf(pdf_content: bytes) -> str:
-    """Extract text from PDF bytes"""
     try:
         pdf_file = io.BytesIO(pdf_content)
         pdf_reader = PdfReader(pdf_file)
@@ -225,20 +233,7 @@ async def extract_text_from_pdf(pdf_content: bytes) -> str:
         logger.error(f"Error extracting PDF text: {str(e)}")
         return ""
 
-
-async def extract_text_from_image(image_bytes: bytes) -> str:
-    """Extract text from image using OCR"""
-    try:
-        image = Image.open(io.BytesIO(image_bytes))
-        text = pytesseract.image_to_string(image)
-        return text
-    except Exception as e:
-        logger.error(f"Error extracting text from image: {str(e)}")
-        return ""
-
-
 async def extract_text_from_docx(docx_bytes: bytes) -> str:
-    """Extract text from DOCX file"""
     try:
         import docx
         doc = docx.Document(io.BytesIO(docx_bytes))
@@ -248,48 +243,34 @@ async def extract_text_from_docx(docx_bytes: bytes) -> str:
         logger.error(f"Error extracting DOCX text: {str(e)}")
         return ""
 
-# ==================== Health Check Route ====================
+async def ask_gemini(prompt: str, system_context: str = "") -> str:
+    """Send a message to Gemini and get a response"""
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        full_prompt = f"{system_context}\n\n{prompt}" if system_context else prompt
+        response = model.generate_content(full_prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Gemini error: {str(e)}")
+        return "I'm sorry, I couldn't process that request. Please try again."
+
+# ==================== Health Check ====================
 
 @api_router.get("/")
 async def health_check():
-    """Health check endpoint"""
-    return {"message": "Hello World", "status": "healthy", "service": "Brain Desk API"}
-
-# ==================== OAuth Configuration ====================
-
-# Canonical URLs - Using the working emergentagent.com domain
-OAUTH_CALLBACK_URL = "https://brain-desk-1.preview.emergentagent.com/api/auth/callback"
-FRONTEND_URL = "https://brain-desk-1.preview.emergentagent.com"
-
-# In-memory state storage (use Redis in production)
-oauth_states = {}
+    return {"message": "Brain Desk API is running!", "status": "healthy"}
 
 # ==================== Authentication Routes ====================
 
 @api_router.get("/auth/login")
 async def login(request: Request):
-    """Initiate Google OAuth flow"""
     try:
-        # Generate secure random state
         import secrets
-        state = secrets.token_urlsafe(32)
-        
-        logger.info("=" * 80)
-        logger.info("OAUTH LOGIN INITIATED")
-        logger.info(f"Generated state: {state}")
-        logger.info(f"Callback URL: {OAUTH_CALLBACK_URL}")
-        logger.info(f"Client ID: {GOOGLE_CLIENT_ID[:20]}...")
-        logger.info("=" * 80)
-        
-        # Store state with timestamp
-        oauth_states[state] = {
-            'created_at': datetime.utcnow(),
-            'redirect_uri': OAUTH_CALLBACK_URL
-        }
-        
-        # Build authorization URL manually WITHOUT Flow/PKCE
         from urllib.parse import urlencode
-        
+
+        state = secrets.token_urlsafe(32)
+        oauth_states[state] = {'created_at': datetime.utcnow()}
+
         auth_params = {
             'client_id': GOOGLE_CLIENT_ID,
             'redirect_uri': OAUTH_CALLBACK_URL,
@@ -300,16 +281,13 @@ async def login(request: Request):
             'include_granted_scopes': 'true',
             'prompt': 'consent'
         }
-        
+
         authorization_url = f"https://accounts.google.com/o/oauth2/auth?{urlencode(auth_params)}"
-        
-        logger.info(f"Authorization URL generated successfully (WITHOUT PKCE)")
-        logger.info(f"Redirect URI in URL: {OAUTH_CALLBACK_URL}")
-        
+        logger.info(f"Login initiated, callback: {OAUTH_CALLBACK_URL}")
         return {"authorization_url": authorization_url}
-        
+
     except Exception as e:
-        logger.error(f"ERROR in login endpoint: {str(e)}", exc_info=True)
+        logger.error(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -318,377 +296,128 @@ async def auth_callback(
     request: Request,
     code: str = None,
     state: str = None,
-    error: str = None,
-    iss: str = None,
-    hd: str = None
+    error: str = None
 ):
-    """Handle Google OAuth callback"""
-    
-    logger.info("=" * 80)
-    logger.info("OAUTH CALLBACK RECEIVED")
-    logger.info(f"Request URL: {request.url}")
-    logger.info(f"Request method: {request.method}")
-    logger.info(f"Query params: code={bool(code)}, state={state[:10] if state else None}..., error={error}")
-    logger.info(f"Additional params: iss={iss}, hd={hd}")
-    logger.info(f"Headers: {dict(request.headers)}")
-    logger.info("=" * 80)
-    
     try:
-        # Check for Google error
         if error:
-            logger.error(f"Google OAuth error: {error}")
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=google_error&message={error}"
-            )
-        
-        # Validate required parameters
-        if not code:
-            logger.error("Missing authorization code")
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=missing_code"
-            )
-        
-        if not state:
-            logger.error("Missing state parameter")
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=missing_state"
-            )
-        
-        logger.info(f"Received code: {code[:20]}...")
-        logger.info(f"Received state: {state}")
-        
-        # Validate state
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/login?error={error}")
+
+        if not code or not state:
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/login?error=missing_params")
+
         if state not in oauth_states:
-            logger.error(f"Invalid state received: {state}")
-            logger.error(f"Valid states in memory: {list(oauth_states.keys())}")
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=invalid_state"
-            )
-        
-        stored_state = oauth_states[state]
-        logger.info(f"State validation passed")
-        logger.info(f"State created at: {stored_state['created_at']}")
-        
-        # Clean up used state
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/login?error=invalid_state")
+
         del oauth_states[state]
-        
-        # Verify credentials
-        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-            logger.error("Google OAuth credentials not configured")
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=config_error"
-            )
-        
-        logger.info(f"Using Client ID: {GOOGLE_CLIENT_ID[:20]}...")
-        logger.info(f"Using redirect_uri: {OAUTH_CALLBACK_URL}")
-        
-        # Exchange code for tokens (manual approach to avoid PKCE)
-        import requests
-        
-        logger.info("Exchanging authorization code for tokens...")
-        
-        try:
-            # Manual token exchange to avoid PKCE
-            token_response = requests.post(
-                "https://oauth2.googleapis.com/token",
-                data={
-                    "code": code,
-                    "client_id": GOOGLE_CLIENT_ID,
-                    "client_secret": GOOGLE_CLIENT_SECRET,
-                    "redirect_uri": OAUTH_CALLBACK_URL,
-                    "grant_type": "authorization_code"
-                }
-            )
-            
-            if token_response.status_code != 200:
-                logger.error(f"Token exchange failed with status {token_response.status_code}")
-                logger.error(f"Response: {token_response.text}")
-                return RedirectResponse(
-                    url=f"{FRONTEND_URL}/auth/login?error=token_exchange_failed"
-                )
-            
-            token_data = token_response.json()
-            access_token = token_data.get("access_token")
-            refresh_token = token_data.get("refresh_token")
-            id_token_str = token_data.get("id_token")
-            
-            logger.info("✅ Token exchange successful")
-            logger.info(f"Access token received: {access_token[:20] if access_token else 'None'}...")
-            logger.info(f"Refresh token: {'Yes' if refresh_token else 'No'}")
-            
-        except Exception as token_error:
-            logger.error(f"❌ Token exchange failed: {str(token_error)}", exc_info=True)
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=token_exchange_failed"
-            )
-        
-        # Verify ID token and get user info
-        logger.info("Verifying ID token...")
-        
-        try:
-            from google.oauth2 import id_token
-            from google.auth.transport import requests as google_requests
-            
-            id_info = id_token.verify_oauth2_token(
-                id_token_str,
-                google_requests.Request(),
-                GOOGLE_CLIENT_ID
-            )
-            
-            google_id = id_info['sub']
-            email = id_info['email']
-            name = id_info.get('name', email)
-            picture = id_info.get('picture', '')
-            
-            logger.info(f"✅ User verified: {email}")
-            logger.info(f"Google ID: {google_id}")
-            logger.info(f"Name: {name}")
-            
-        except Exception as verify_error:
-            logger.error(f"❌ ID token verification failed: {str(verify_error)}", exc_info=True)
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=verification_failed"
-            )
-        
-        # Create or update user in database
-        logger.info("Checking database for existing user...")
-        
-        try:
-            existing_user = await db.users.find_one({"google_id": google_id})
-            
-            if existing_user:
-                # Update existing user
-                await db.users.update_one(
-                    {"google_id": google_id},
-                    {"$set": {
-                        "access_token": access_token,
-                        "refresh_token": refresh_token,
-                        "picture": picture,
-                        "name": name
-                    }}
-                )
-                user_id = existing_user['id']
-                logger.info(f"✅ Updated existing user: {user_id}")
-            else:
-                # Create new user
-                user = User(
-                    google_id=google_id,
-                    email=email,
-                    name=name,
-                    picture=picture,
-                    access_token=access_token,
-                    refresh_token=refresh_token
-                )
-                await db.users.insert_one(user.dict())
-                user_id = user.id
-                logger.info(f"✅ Created new user: {user_id}")
-        
-        except Exception as db_error:
-            logger.error(f"❌ Database error: {str(db_error)}", exc_info=True)
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=database_error"
-            )
-        
-        # Create session
-        logger.info("Creating session...")
-        
-        try:
-            request.session['user_id'] = user_id
-            request.session['email'] = email
-            logger.info(f"✅ Session created successfully")
-            logger.info(f"Session data: user_id={user_id}, email={email}")
-            
-        except Exception as session_error:
-            logger.error(f"❌ Session creation failed: {str(session_error)}", exc_info=True)
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/auth/login?error=session_error"
-            )
-        
-        # Success! Redirect to frontend with user_id as query param
-        # Frontend will capture this and call /api/auth/me with credentials
-        logger.info(f"✅ OAuth flow completed successfully")
-        logger.info(f"Redirecting to: {FRONTEND_URL}?user_id={user_id}")
-        logger.info("=" * 80)
-        
-        # Redirect with user_id so frontend can fetch user data
-        return RedirectResponse(url=f"{FRONTEND_URL}?auth_success=true&user_id={user_id}")
-        
-    except Exception as e:
-        logger.error("=" * 80)
-        logger.error(f"❌ UNEXPECTED ERROR in callback: {str(e)}")
-        logger.error("=" * 80, exc_info=True)
-        return RedirectResponse(
-            url=f"{FRONTEND_URL}/auth/login?error=unexpected_error&message={str(e)}"
+
+        import requests as http_requests
+
+        token_response = http_requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": OAUTH_CALLBACK_URL,
+                "grant_type": "authorization_code"
+            }
         )
-        
-        credentials = flow.credentials
-        logger.info("Token fetched successfully")
-        
-        # Get user info
+
+        if token_response.status_code != 200:
+            logger.error(f"Token exchange failed: {token_response.text}")
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/login?error=token_failed")
+
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        id_token_str = token_data.get("id_token")
+
         from google.oauth2 import id_token
-        from google.auth.transport import requests
-        
-        logger.info("Verifying ID token...")
+        from google.auth.transport import requests as google_requests
+
         id_info = id_token.verify_oauth2_token(
-            credentials.id_token,
-            requests.Request(),
+            id_token_str,
+            google_requests.Request(),
             GOOGLE_CLIENT_ID
         )
-        
+
         google_id = id_info['sub']
         email = id_info['email']
         name = id_info.get('name', email)
         picture = id_info.get('picture', '')
-        
-        logger.info(f"User authenticated: {email}")
-        
-        # Check if user exists
+
         existing_user = await db.users.find_one({"google_id": google_id})
-        
+
         if existing_user:
-            # Update tokens
             await db.users.update_one(
                 {"google_id": google_id},
                 {"$set": {
-                    "access_token": credentials.token,
-                    "refresh_token": credentials.refresh_token,
-                    "picture": picture
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "picture": picture,
+                    "name": name
                 }}
             )
             user_id = existing_user['id']
-            logger.info(f"Updated existing user: {user_id}")
         else:
-            # Create new user
             user = User(
                 google_id=google_id,
                 email=email,
                 name=name,
                 picture=picture,
-                access_token=credentials.token,
-                refresh_token=credentials.refresh_token
+                access_token=access_token,
+                refresh_token=refresh_token
             )
             await db.users.insert_one(user.dict())
             user_id = user.id
-            logger.info(f"Created new user: {user_id}")
-        
-        # Store user_id in session (create new session for this domain)
+
         request.session['user_id'] = user_id
-        logger.info("Session created successfully")
-        
-        # Redirect to frontend homepage
-        frontend_url = "https://brain-desk-1.preview.emergentagent.com"
-        logger.info(f"Redirecting to: {frontend_url}")
-        return RedirectResponse(url=frontend_url)
-        
+        logger.info(f"User logged in: {email}")
+        return RedirectResponse(url=f"{FRONTEND_URL}?auth_success=true&user_id={user_id}")
+
     except Exception as e:
-        logger.error(f"OAuth callback error: {str(e)}", exc_info=True)
-        # Return error page instead of 403
-        return RedirectResponse(
-            url=f"https://brain-desk-1.preview.emergentagent.com/auth/login?error={str(e)}"
-        )
-    
-    credentials = flow.credentials
-    
-    # Get user info
-    from google.oauth2 import id_token
-    from google.auth.transport import requests
-    
-    id_info = id_token.verify_oauth2_token(
-        credentials.id_token,
-        requests.Request(),
-        GOOGLE_CLIENT_ID
-    )
-    
-    google_id = id_info['sub']
-    email = id_info['email']
-    name = id_info.get('name', email)
-    picture = id_info.get('picture', '')
-    
-    # Check if user exists
-    existing_user = await db.users.find_one({"google_id": google_id})
-    
-    if existing_user:
-        # Update tokens
-        await db.users.update_one(
-            {"google_id": google_id},
-            {"$set": {
-                "access_token": credentials.token,
-                "refresh_token": credentials.refresh_token,
-                "picture": picture
-            }}
-        )
-        user_id = existing_user['id']
-    else:
-        # Create new user
-        user = User(
-            google_id=google_id,
-            email=email,
-            name=name,
-            picture=picture,
-            access_token=credentials.token,
-            refresh_token=credentials.refresh_token
-        )
-        await db.users.insert_one(user.dict())
-        user_id = user.id
-    
-    # Store user_id in session
-    request.session['user_id'] = user_id
-    
-    # Redirect to frontend homepage
-    frontend_url = "https://brain-desk-1.preview.emergentagent.com"
-    return RedirectResponse(url=frontend_url)
+        logger.error(f"Callback error: {str(e)}", exc_info=True)
+        return RedirectResponse(url=f"{FRONTEND_URL}/auth/login?error=unexpected")
+
 
 @api_router.get("/auth/user/{user_id}")
 async def get_user_by_id(user_id: str):
-    """Get user by ID (for post-OAuth frontend auth)"""
-    try:
-        user = await db.users.find_one({"id": user_id})
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        return User(**user)
-    except Exception as e:
-        logger.error(f"Error fetching user: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return User(**user)
 
 
 @api_router.get("/auth/me")
 async def get_me(user: User = Depends(get_current_user)):
-    """Get current user"""
     return user
+
 
 @api_router.post("/auth/logout")
 async def logout(request: Request):
-    """Logout user"""
     request.session.clear()
     return {"message": "Logged out successfully"}
 
-# ==================== Google Classroom Routes ====================
+# ==================== Google Classroom Sync ====================
 
 @api_router.get("/sync/classroom")
 async def sync_classroom(user: User = Depends(get_current_user)):
-    """Sync courses, assignments, AND materials from Google Classroom"""
     try:
         creds = get_google_credentials(user)
         classroom_service = build('classroom', 'v1', credentials=creds)
         drive_service = build('drive', 'v3', credentials=creds)
-        
-        logger.info(f"Starting Classroom sync for user: {user.email}")
-        
-        # Fetch courses
+
         results = classroom_service.courses().list(pageSize=100).execute()
         courses = results.get('courses', [])
-        
+
         synced_courses = []
         synced_assignments = []
         synced_notes = 0
-        
+
         for course in courses:
             course_id = course['id']
             course_name = course.get('name', 'Untitled Course')
-            
-            logger.info(f"Processing course: {course_name}")
-            
+
             course_data = Course(
                 user_id=user.id,
                 classroom_id=course_id,
@@ -698,13 +427,12 @@ async def sync_classroom(user: User = Depends(get_current_user)):
                 teacher_name=course.get('ownerId', ''),
                 enrollment_code=course.get('enrollmentCode', '')
             )
-            
-            # Check if course exists
+
             existing_course = await db.courses.find_one({
                 "user_id": user.id,
                 "classroom_id": course_id
             })
-            
+
             if existing_course:
                 await db.courses.update_one(
                     {"user_id": user.id, "classroom_id": course_id},
@@ -714,522 +442,173 @@ async def sync_classroom(user: User = Depends(get_current_user)):
             else:
                 await db.courses.insert_one(course_data.dict())
                 db_course_id = course_data.id
-            
+
             synced_courses.append(course_data)
-            
-            # Fetch coursework (assignments) with materials
+
+            # Fetch coursework
             try:
                 coursework_results = classroom_service.courses().courseWork().list(
                     courseId=course_id
                 ).execute()
                 coursework_items = coursework_results.get('courseWork', [])
-                
-                logger.info(f"Found {len(coursework_items)} coursework items in {course_name}")
-                
+
                 for item in coursework_items:
-                    # Save assignment
                     due_date = None
                     if 'dueDate' in item:
-                        due_date_data = item['dueDate']
-                        due_date = datetime(
-                            due_date_data.get('year', 2025),
-                            due_date_data.get('month', 1),
-                            due_date_data.get('day', 1)
-                        )
-                    
+                        d = item['dueDate']
+                        due_date = datetime(d.get('year', 2025), d.get('month', 1), d.get('day', 1))
+
                     assignment_data = Assignment(
                         user_id=user.id,
                         course_id=db_course_id,
                         classroom_id=course_id,
-                        title=item.get('title', 'Untitled Assignment'),
+                        title=item.get('title', 'Untitled'),
                         description=item.get('description', ''),
                         due_date=due_date,
                         state="PENDING",
                         link=item.get('alternateLink', '')
                     )
-                    
-                    existing_assignment = await db.assignments.find_one({
+
+                    existing = await db.assignments.find_one({
                         "user_id": user.id,
                         "classroom_id": course_id,
                         "title": assignment_data.title
                     })
-                    
-                    if not existing_assignment:
+
+                    if not existing:
                         await db.assignments.insert_one(assignment_data.dict())
                         synced_assignments.append(assignment_data)
-                    
-                    # Process materials/attachments
-                    materials = item.get('materials', [])
-                    
-                    for material in materials:
-                        # Check for Drive files
+
+                    # Process materials
+                    for material in item.get('materials', []):
                         if 'driveFile' in material:
                             drive_file = material['driveFile']['driveFile']
                             file_id = drive_file['id']
-                            file_title = drive_file.get('title', 'Untitled File')
-                            
-                            logger.info(f"Processing Drive file: {file_title}")
-                            
-                            # Download and process PDF
+                            file_title = drive_file.get('title', 'Untitled')
+
                             if file_title.lower().endswith('.pdf'):
                                 try:
-                                    # Download PDF content
-                                    request = drive_service.files().get_media(fileId=file_id)
+                                    req = drive_service.files().get_media(fileId=file_id)
                                     file_content = io.BytesIO()
-                                    downloader = MediaIoBaseDownload(file_content, request)
-                                    
+                                    downloader = MediaIoBaseDownload(file_content, req)
                                     done = False
                                     while not done:
-                                        status, done = downloader.next_chunk()
-                                    
+                                        _, done = downloader.next_chunk()
                                     file_content.seek(0)
-                                    
-                                    # Extract text from PDF
                                     pdf_text = await extract_text_from_pdf(file_content.read())
-                                    
+
                                     if pdf_text:
-                                        # Save as note
-                                        note = Note(
-                                            user_id=user.id,
-                                            course_id=db_course_id,
-                                            title=file_title,
-                                            content=pdf_text[:10000],  # Limit size
-                                            attachments=[{
-                                                'type': 'drive_file',
-                                                'file_id': file_id,
-                                                'title': file_title
-                                            }]
-                                        )
-                                        
-                                        # Check if note already exists
                                         existing_note = await db.notes.find_one({
                                             "user_id": user.id,
                                             "course_id": db_course_id,
                                             "title": file_title
                                         })
-                                        
                                         if not existing_note:
+                                            note = Note(
+                                                user_id=user.id,
+                                                course_id=db_course_id,
+                                                title=file_title,
+                                                content=pdf_text[:10000],
+                                                attachments=[{'type': 'drive_file', 'file_id': file_id}]
+                                            )
                                             await db.notes.insert_one(note.dict())
                                             synced_notes += 1
-                                            logger.info(f"✅ Saved PDF note: {file_title} ({len(pdf_text)} chars)")
-                                
-                                except Exception as pdf_error:
-                                    logger.error(f"Error processing PDF {file_title}: {str(pdf_error)}")
-                        
-                        # Check for links
-                        elif 'link' in material:
-                            link_url = material['link'].get('url', '')
-                            link_title = material['link'].get('title', 'Link')
-                            
-                            # Save link as note
-                            note = Note(
-                                user_id=user.id,
-                                course_id=db_course_id,
-                                title=link_title,
-                                content=f"Link: {link_url}",
-                                attachments=[{
-                                    'type': 'link',
-                                    'url': link_url,
-                                    'title': link_title
-                                }]
-                            )
-                            
-                            existing_note = await db.notes.find_one({
-                                "user_id": user.id,
-                                "course_id": db_course_id,
-                                "title": link_title
-                            })
-                            
-                            if not existing_note:
-                                await db.notes.insert_one(note.dict())
-                                synced_notes += 1
-            
-            except HttpError as e:
-                logger.warning(f"Could not fetch coursework for {course_id}: {str(e)}")
-            
-            # Fetch course materials
-            try:
-                materials_results = classroom_service.courses().courseWorkMaterials().list(
-                    courseId=course_id
-                ).execute()
-                materials_items = materials_results.get('courseWorkMaterial', [])
-                
-                logger.info(f"Found {len(materials_items)} course materials in {course_name}")
-                
-                for material_item in materials_items:
-                    materials = material_item.get('materials', [])
-                    
-                    for material in materials:
-                        if 'driveFile' in material:
-                            drive_file = material['driveFile']['driveFile']
-                            file_id = drive_file['id']
-                            file_title = drive_file.get('title', 'Untitled File')
-                            
-                            # Download PDF
-                            if file_title.lower().endswith('.pdf'):
-                                try:
-                                    request = drive_service.files().get_media(fileId=file_id)
-                                    file_content = io.BytesIO()
-                                    downloader = MediaIoBaseDownload(file_content, request)
-                                    
-                                    done = False
-                                    while not done:
-                                        status, done = downloader.next_chunk()
-                                    
-                                    file_content.seek(0)
-                                    pdf_text = await extract_text_from_pdf(file_content.read())
-                                    
-                                    if pdf_text:
-                                        note = Note(
-                                            user_id=user.id,
-                                            course_id=db_course_id,
-                                            title=file_title,
-                                            content=pdf_text[:10000],
-                                            attachments=[{
-                                                'type': 'drive_file',
-                                                'file_id': file_id,
-                                                'title': file_title
-                                            }]
-                                        )
-                                        
-                                        existing_note = await db.notes.find_one({
-                                            "user_id": user.id,
-                                            "course_id": db_course_id,
-                                            "title": file_title
-                                        })
-                                        
-                                        if not existing_note:
-                                            await db.notes.insert_one(note.dict())
-                                            synced_notes += 1
-                                            logger.info(f"✅ Saved material: {file_title}")
-                                
                                 except Exception as e:
-                                    logger.error(f"Error processing material {file_title}: {str(e)}")
-            
+                                    logger.error(f"PDF error: {str(e)}")
+
             except HttpError as e:
-                logger.warning(f"Could not fetch materials for {course_id}: {str(e)}")
-        
-        logger.info(f"Sync complete: {len(synced_courses)} courses, {len(synced_assignments)} assignments, {synced_notes} notes")
-        
+                logger.warning(f"Coursework fetch error: {str(e)}")
+
         return {
             "message": "Sync completed",
             "courses_synced": len(synced_courses),
             "assignments_synced": len(synced_assignments),
             "notes_synced": synced_notes
         }
-    
+
     except Exception as e:
-        logger.error(f"Error syncing classroom: {str(e)}", exc_info=True)
+        logger.error(f"Classroom sync error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== Courses Routes ====================
 
 @api_router.get("/courses")
 async def get_courses(user: User = Depends(get_current_user)):
-    """Get all courses for the user"""
     courses = await db.courses.find({"user_id": user.id}).to_list(1000)
-    
-    # Get counts for each course
     result = []
     for course in courses:
-        notes_count = await db.notes.count_documents({
-            "user_id": user.id,
-            "course_id": course['id']
-        })
+        notes_count = await db.notes.count_documents({"user_id": user.id, "course_id": course['id']})
         assignments_count = await db.assignments.count_documents({
-            "user_id": user.id,
-            "course_id": course['id'],
-            "state": "PENDING"
+            "user_id": user.id, "course_id": course['id'], "state": "PENDING"
         })
-        
-        course_data = Course(**course)
-        result.append({
-            **course_data.dict(),
-            "notes_count": notes_count,
-            "assignments_count": assignments_count
-        })
-    
+        result.append({**Course(**course).dict(), "notes_count": notes_count, "assignments_count": assignments_count})
     return result
-
-@api_router.get("/courses/{course_id}/files")
-async def get_course_files(course_id: str, user: User = Depends(get_current_user)):
-    """Get all files/notes for a specific course from ALL sources"""
-    try:
-        # Get notes from Classroom/Drive
-        classroom_notes = await db.notes.find({
-            "user_id": user.id,
-            "course_id": course_id
-        }).sort("created_at", -1).to_list(1000)
-        
-        # Get notes from Email
-        email_notes = await db.email_attachments.find({
-            "user_id": user.id,
-            "course_id": course_id
-        }).sort("received_date", -1).to_list(1000)
-        
-        files = []
-        
-        # Add classroom/drive files
-        for note in classroom_notes:
-            file_info = {
-                "id": note['id'],
-                "title": note['title'],
-                "content": note['content'],
-                "created_at": note['created_at'],
-                "updated_at": note['updated_at'],
-                "source": "classroom",
-                "content_preview": note['content'][:200] + "..." if len(note['content']) > 200 else note['content'],
-                "content_length": len(note['content']),
-                "file_type": "PDF" if note['title'].lower().endswith('.pdf') else "Document",
-                "has_content": len(note['content']) > 0
-            }
-            files.append(file_info)
-        
-        # Add email files
-        for email_note in email_notes:
-            file_info = {
-                "id": email_note['id'],
-                "title": email_note['file_name'],
-                "content": email_note['content'],
-                "created_at": email_note['received_date'],
-                "updated_at": email_note['received_date'],
-                "source": "email",
-                "sender": email_note.get('sender', ''),
-                "subject": email_note.get('subject', ''),
-                "content_preview": email_note['content'][:200] + "..." if len(email_note['content']) > 200 else email_note['content'],
-                "content_length": len(email_note['content']),
-                "file_type": email_note.get('file_type', 'Document'),
-                "has_content": len(email_note['content']) > 0
-            }
-            files.append(file_info)
-        
-        # Sort by date
-        files.sort(key=lambda x: x['created_at'], reverse=True)
-        
-        return {
-            "course_id": course_id,
-            "total_files": len(files),
-            "classroom_files": len(classroom_notes),
-            "email_files": len(email_notes),
-            "files": files
-        }
-    
-    except Exception as e:
-        logger.error(f"Error getting course files: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.get("/courses/{course_id}/download")
-async def download_course_files(course_id: str, user: User = Depends(get_current_user)):
-    """Download all files for a course as ZIP"""
-    try:
-        from fastapi.responses import StreamingResponse
-        
-        # Get course info
-        course = await db.courses.find_one({"id": course_id, "user_id": user.id})
-        if not course:
-            raise HTTPException(status_code=404, detail="Course not found")
-        
-        course_name = course['name'].replace('/', '-').replace('\\', '-')
-        
-        # Get all notes for this course
-        notes = await db.notes.find({
-            "user_id": user.id,
-            "course_id": course_id
-        }).to_list(1000)
-        
-        # Create ZIP file in memory
-        zip_buffer = io.BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for note in notes:
-                # Create filename
-                filename = note['title']
-                if not filename.endswith('.txt') and not filename.endswith('.pdf'):
-                    filename += '.txt'
-                
-                # Add note content to ZIP
-                zip_file.writestr(filename, note['content'])
-        
-        zip_buffer.seek(0)
-        
-        return StreamingResponse(
-            zip_buffer,
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f"attachment; filename={course_name}_files.zip"
-            }
-        )
-    
-    except Exception as e:
-        logger.error(f"Error downloading course files: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.get("/notes/download-all")
-async def download_all_notes(user: User = Depends(get_current_user)):
-    """Download all notes from all courses as structured ZIP"""
-    try:
-        from fastapi.responses import StreamingResponse
-        
-        # Get all courses
-        courses = await db.courses.find({"user_id": user.id}).to_list(100)
-        
-        # Create ZIP file in memory
-        zip_buffer = io.BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for course in courses:
-                course_name = course['name'].replace('/', '-').replace('\\', '-')
-                course_folder = f"BrainDesk_Notes/{course_name}/"
-                
-                # Get notes for this course
-                notes = await db.notes.find({
-                    "user_id": user.id,
-                    "course_id": course['id']
-                }).to_list(1000)
-                
-                for note in notes:
-                    filename = note['title']
-                    if not filename.endswith('.txt') and not filename.endswith('.pdf'):
-                        filename += '.txt'
-                    
-                    # Add to course folder
-                    zip_file.writestr(course_folder + filename, note['content'])
-        
-        zip_buffer.seek(0)
-        
-        return StreamingResponse(
-            zip_buffer,
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f"attachment; filename=BrainDesk_All_Notes.zip"
-            }
-        )
-    
-    except Exception as e:
-        logger.error(f"Error downloading all notes: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.get("/calendar/events")
-async def get_calendar_events(
-    month: int = None,
-    year: int = None,
-    user: User = Depends(get_current_user)
-):
-    """Get calendar events (assignments and notes) for a specific month"""
-    try:
-        # Default to current month if not provided
-        if not month or not year:
-            now = datetime.utcnow()
-            month = now.month
-            year = now.year
-        
-        # Get start and end of month
-        start_date = datetime(year, month, 1)
-        if month == 12:
-            end_date = datetime(year + 1, 1, 1)
-        else:
-            end_date = datetime(year, month + 1, 1)
-        
-        # Get assignments for the month
-        assignments = await db.assignments.find({
-            "user_id": user.id,
-            "due_date": {
-                "$gte": start_date,
-                "$lt": end_date
-            }
-        }).to_list(1000)
-        
-        # Get notes created in the month
-        notes = await db.notes.find({
-            "user_id": user.id,
-            "created_at": {
-                "$gte": start_date,
-                "$lt": end_date
-            }
-        }).to_list(1000)
-        
-        # Get courses for context
-        course_ids = set([a['course_id'] for a in assignments] + [n.get('course_id') for n in notes if n.get('course_id')])
-        courses_map = {}
-        
-        for course_id in course_ids:
-            if course_id:
-                course = await db.courses.find_one({"id": course_id, "user_id": user.id})
-                if course:
-                    courses_map[course_id] = course['name']
-        
-        # Organize by date
-        events_by_date = {}
-        
-        # Add assignments
-        for assignment in assignments:
-            if assignment.get('due_date'):
-                date_key = assignment['due_date'].strftime('%Y-%m-%d')
-                if date_key not in events_by_date:
-                    events_by_date[date_key] = {"assignments": [], "notes": []}
-                
-                events_by_date[date_key]["assignments"].append({
-                    "id": assignment['id'],
-                    "title": assignment['title'],
-                    "course_name": courses_map.get(assignment['course_id'], 'Unknown'),
-                    "state": assignment.get('state', 'PENDING')
-                })
-        
-        # Add notes
-        for note in notes:
-            date_key = note['created_at'].strftime('%Y-%m-%d')
-            if date_key not in events_by_date:
-                events_by_date[date_key] = {"assignments": [], "notes": []}
-            
-            events_by_date[date_key]["notes"].append({
-                "id": note['id'],
-                "title": note['title'],
-                "course_name": courses_map.get(note.get('course_id'), 'Unknown'),
-            })
-        
-        return {
-            "month": month,
-            "year": year,
-            "events_by_date": events_by_date,
-            "total_assignments": len(assignments),
-            "total_notes": len(notes)
-        }
-    
-    except Exception as e:
-        logger.error(f"Error getting calendar events: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @api_router.get("/courses/{course_id}")
 async def get_course(course_id: str, user: User = Depends(get_current_user)):
-    """Get a specific course"""
     course = await db.courses.find_one({"id": course_id, "user_id": user.id})
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
     return Course(**course)
 
+
+@api_router.get("/courses/{course_id}/files")
+async def get_course_files(course_id: str, user: User = Depends(get_current_user)):
+    notes = await db.notes.find({"user_id": user.id, "course_id": course_id}).sort("created_at", -1).to_list(1000)
+    email_notes = await db.email_attachments.find({"user_id": user.id, "course_id": course_id}).to_list(1000)
+
+    files = []
+    for note in notes:
+        files.append({
+            "id": note['id'], "title": note['title'], "content": note['content'],
+            "created_at": note['created_at'], "source": "classroom",
+            "content_preview": note['content'][:200] + "..." if len(note['content']) > 200 else note['content'],
+            "content_length": len(note['content']),
+            "file_type": "PDF" if note['title'].lower().endswith('.pdf') else "Document"
+        })
+    for en in email_notes:
+        files.append({
+            "id": en['id'], "title": en['file_name'], "content": en['content'],
+            "created_at": en['received_date'], "source": "email",
+            "sender": en.get('sender', ''), "subject": en.get('subject', ''),
+            "content_preview": en['content'][:200] + "..." if len(en['content']) > 200 else en['content'],
+            "content_length": len(en['content']), "file_type": en.get('file_type', 'Document')
+        })
+
+    files.sort(key=lambda x: x['created_at'], reverse=True)
+    return {"course_id": course_id, "total_files": len(files), "files": files}
+
+
+@api_router.get("/courses/{course_id}/download")
+async def download_course_files(course_id: str, user: User = Depends(get_current_user)):
+    course = await db.courses.find_one({"id": course_id, "user_id": user.id})
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    notes = await db.notes.find({"user_id": user.id, "course_id": course_id}).to_list(1000)
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for note in notes:
+            filename = note['title'] if note['title'].endswith(('.txt', '.pdf')) else note['title'] + '.txt'
+            zf.writestr(filename, note['content'])
+
+    zip_buffer.seek(0)
+    course_name = course['name'].replace('/', '-')
+    return StreamingResponse(zip_buffer, media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={course_name}_files.zip"})
+
 # ==================== Assignments Routes ====================
 
 @api_router.get("/assignments")
 async def get_assignments(user: User = Depends(get_current_user)):
-    """Get all assignments for the user"""
     assignments = await db.assignments.find({"user_id": user.id}).sort("due_date", 1).to_list(1000)
     return [Assignment(**a) for a in assignments]
 
-@api_router.get("/assignments/{assignment_id}")
-async def get_assignment(assignment_id: str, user: User = Depends(get_current_user)):
-    """Get a specific assignment"""
-    assignment = await db.assignments.find_one({"id": assignment_id, "user_id": user.id})
-    if not assignment:
-        raise HTTPException(status_code=404, detail="Assignment not found")
-    return Assignment(**assignment)
 
 @api_router.patch("/assignments/{assignment_id}/complete")
 async def complete_assignment(assignment_id: str, user: User = Depends(get_current_user)):
-    """Mark assignment as complete"""
     result = await db.assignments.update_one(
         {"id": assignment_id, "user_id": user.id},
         {"$set": {"state": "COMPLETED"}}
@@ -1242,671 +621,366 @@ async def complete_assignment(assignment_id: str, user: User = Depends(get_curre
 
 @api_router.get("/notes")
 async def get_notes(course_id: Optional[str] = None, user: User = Depends(get_current_user)):
-    """Get all notes for the user"""
     query = {"user_id": user.id}
     if course_id:
         query["course_id"] = course_id
-    
     notes = await db.notes.find(query).sort("updated_at", -1).to_list(1000)
     return [Note(**n) for n in notes]
 
+
 @api_router.post("/notes")
 async def create_note(note_data: NoteCreate, user: User = Depends(get_current_user)):
-    """Create a new note"""
-    note = Note(
-        user_id=user.id,
-        course_id=note_data.course_id,
-        title=note_data.title,
-        content=note_data.content,
-        attachments=note_data.attachments or []
-    )
+    note = Note(user_id=user.id, course_id=note_data.course_id,
+                title=note_data.title, content=note_data.content,
+                attachments=note_data.attachments or [])
     await db.notes.insert_one(note.dict())
     return note
 
-@api_router.get("/notes/{note_id}")
-async def get_note(note_id: str, user: User = Depends(get_current_user)):
-    """Get a specific note"""
-    note = await db.notes.find_one({"id": note_id, "user_id": user.id})
-    if not note:
-        raise HTTPException(status_code=404, detail="Note not found")
-    return Note(**note)
 
 @api_router.put("/notes/{note_id}")
 async def update_note(note_id: str, note_data: NoteCreate, user: User = Depends(get_current_user)):
-    """Update a note"""
     result = await db.notes.update_one(
         {"id": note_id, "user_id": user.id},
-        {"$set": {
-            "title": note_data.title,
-            "content": note_data.content,
-            "attachments": note_data.attachments or [],
-            "updated_at": datetime.utcnow()
-        }}
+        {"$set": {"title": note_data.title, "content": note_data.content,
+                  "attachments": note_data.attachments or [], "updated_at": datetime.utcnow()}}
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Note not found")
-    return {"message": "Note updated successfully"}
+    return {"message": "Note updated"}
+
 
 @api_router.delete("/notes/{note_id}")
 async def delete_note(note_id: str, user: User = Depends(get_current_user)):
-    """Delete a note"""
     result = await db.notes.delete_one({"id": note_id, "user_id": user.id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Note not found")
-    return {"message": "Note deleted successfully"}
+    return {"message": "Note deleted"}
 
-# ==================== AI Chat Routes ====================
+# ==================== AI Chat (Gemini) ====================
 
 @api_router.post("/chat")
 async def chat(request: ChatRequest, user: User = Depends(get_current_user)):
-    """Chat with AI tutor using retrieved notes"""
     try:
         session_id = request.session_id or str(uuid.uuid4())
-        
-        logger.info(f"Chat request from {user.email}: {request.message[:50]}...")
-        
-        # Try to identify course from message
-        user_message_lower = request.message.lower()
-        
-        # Get all user's courses
         courses = await db.courses.find({"user_id": user.id}).to_list(100)
-        
+
         identified_course_id = request.course_id
         identified_course_name = None
-        
-        # Try to match course from message if not explicitly provided
+
         if not identified_course_id:
+            msg_lower = request.message.lower()
             for course in courses:
-                course_name_lower = course['name'].lower()
-                # Check for course name mentions
-                if course_name_lower in user_message_lower or any(
-                    keyword in user_message_lower 
-                    for keyword in course_name_lower.split()
-                    if len(keyword) > 3
-                ):
+                if course['name'].lower() in msg_lower:
                     identified_course_id = course['id']
                     identified_course_name = course['name']
-                    logger.info(f"Identified course from message: {course['name']}")
                     break
         else:
-            # Get course name
             for course in courses:
                 if course['id'] == identified_course_id:
                     identified_course_name = course['name']
                     break
-        
-        # Get relevant notes for context
+
         query = {"user_id": user.id}
         if identified_course_id:
             query["course_id"] = identified_course_id
-            logger.info(f"Filtering notes by course: {identified_course_id}")
-        
-        # Get notes from classroom/drive
-        notes = await db.notes.find(query).to_list(100)
-        
-        # Get notes from email
-        email_notes = await db.email_attachments.find(query).to_list(50) if identified_course_id else []
-        
-        total_notes = len(notes) + len(email_notes)
-        
-        logger.info(f"Retrieved {len(notes)} classroom notes + {len(email_notes)} email notes = {total_notes} total")
-        
-        # Build context from notes with better formatting
-        if total_notes > 0:
-            context = f"=== STUDENT'S COURSE MATERIALS FOR {identified_course_name.upper() if identified_course_name else 'ALL COURSES'} ===\n\n"
-            
+
+        notes = await db.notes.find(query).to_list(50)
+
+        context = ""
+        if notes:
+            context = f"=== COURSE MATERIALS: {identified_course_name or 'ALL COURSES'} ===\n\n"
             for note in notes:
-                context += f"📄 {note['title']} (Source: Classroom)\n"
-                context += f"{note['content'][:2000]}\n"
-                context += "\n" + "="*50 + "\n\n"
-            
-            for email_note in email_notes:
-                context += f"📧 {email_note['file_name']} (Source: Email from {email_note.get('sender', 'Unknown')})\n"
-                context += f"{email_note['content'][:2000]}\n"
-                context += "\n" + "="*50 + "\n\n"
-            
-            context += "\n=== END OF MATERIALS ===\n"
+                context += f"📄 {note['title']}\n{note['content'][:2000]}\n\n{'='*40}\n\n"
         else:
-            if identified_course_name:
-                context = f"No files have been synced yet for {identified_course_name} course. The student should sync their Google Classroom or email to get course materials.\n"
-            else:
-                context = "No course materials have been synced yet. Please sync your Google Classroom first.\n"
+            context = "No course materials synced yet. Please sync your Google Classroom first.\n"
+
+        system_prompt = f"""You are Brain Desk AI, a helpful study assistant for a college student.
         
-        # Create chat with context
-        if total_notes > 0:
-            system_message = f"""You are a helpful AI tutor assistant for a student.
+You have access to the student's course materials below. When answering:
+1. Search through the materials first
+2. Cite which document your answer comes from
+3. If not in materials, say so and give general guidance
+4. Be concise and student-friendly
 
-IMPORTANT: The student has shared their course materials with you below. When answering questions:
-1. ALWAYS search through the provided materials first
-2. If the answer is in the materials, cite which document it came from
-3. If the answer is NOT in the materials, clearly state that and provide general educational guidance
-4. Be specific and reference the actual content from their notes
-5. If they ask about a specific course and you have materials for it, use those materials
+{context}"""
 
-The student asked: "{request.message}"
+        response = await ask_gemini(request.message, system_prompt)
 
-{context}
+        user_msg = ChatMessage(user_id=user.id, session_id=session_id, role="user", content=request.message)
+        assistant_msg = ChatMessage(user_id=user.id, session_id=session_id, role="assistant", content=response)
 
-Now help the student with their question using the materials above."""
-        else:
-            system_message = f"""You are a helpful AI tutor assistant for a student.
-
-The student asked: "{request.message}"
-
-{context}
-
-Since no course materials are available, let them know they need to sync their materials first."""
-        
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=session_id,
-            system_message=system_message
-        )
-        chat.with_model("openai", "gpt-4o")
-        
-        user_message_obj = UserMessage(text=request.message)
-        response = await chat.send_message(user_message_obj)
-        
-        # Save chat messages
-        user_msg = ChatMessage(
-            user_id=user.id,
-            session_id=session_id,
-            role="user",
-            content=request.message
-        )
-        assistant_msg = ChatMessage(
-            user_id=user.id,
-            session_id=session_id,
-            role="assistant",
-            content=response
-        )
-        
         await db.chat_messages.insert_one(user_msg.dict())
         await db.chat_messages.insert_one(assistant_msg.dict())
-        
-        logger.info(f"Chat response generated ({len(response)} chars) using {total_notes} files")
-        
+
         return {
             "session_id": session_id,
             "response": response,
-            "notes_used": total_notes,
+            "notes_used": len(notes),
             "course_identified": identified_course_name
         }
-    
+
     except Exception as e:
-        logger.error(f"Error in chat: {str(e)}", exc_info=True)
+        logger.error(f"Chat error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @api_router.get("/chat/history/{session_id}")
 async def get_chat_history(session_id: str, user: User = Depends(get_current_user)):
-    """Get chat history for a session"""
     messages = await db.chat_messages.find({
-        "user_id": user.id,
-        "session_id": session_id
+        "user_id": user.id, "session_id": session_id
     }).sort("timestamp", 1).to_list(1000)
-    
     return [ChatMessage(**m) for m in messages]
 
-@api_router.get("/chat/sessions")
-async def get_chat_sessions(user: User = Depends(get_current_user)):
-    """Get all chat sessions"""
-    pipeline = [
-        {"$match": {"user_id": user.id}},
-        {"$group": {
-            "_id": "$session_id",
-            "last_message": {"$last": "$content"},
-            "last_timestamp": {"$last": "$timestamp"}
-        }},
-        {"$sort": {"last_timestamp": -1}}
-    ]
-    
-    sessions = await db.chat_messages.aggregate(pipeline).to_list(100)
-    return sessions
-
-# ==================== Quiz Routes ====================
+# ==================== Quiz (Gemini) ====================
 
 @api_router.post("/quiz/generate")
 async def generate_quiz(request: QuizGenerateRequest, user: User = Depends(get_current_user)):
-    """Generate a quiz from notes"""
     try:
-        # Get notes
         query = {"user_id": user.id}
         if request.course_id:
             query["course_id"] = request.course_id
-        
-        notes = await db.notes.find(query).to_list(100)
-        
+
+        notes = await db.notes.find(query).to_list(20)
         if not notes:
-            raise HTTPException(status_code=400, detail="No notes found to generate quiz from")
-        
-        # Build context
-        context = ""
-        for note in notes:
-            context += f"{note['title']}\n{note['content']}\n\n"
-        
-        # Generate quiz using AI
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=str(uuid.uuid4()),
-            system_message=f"You are a quiz generator. Generate {request.num_questions} multiple choice questions based on the following content. Return ONLY a JSON array of objects with 'question', 'options' (array of 4 strings), and 'correct_answer' (0-3 index). No additional text."
-        )
-        chat.with_model("openai", "gpt-4o")
-        
-        prompt = f"Generate {request.num_questions} MCQs on the topic: {request.topic}\n\nContent:\n{context[:4000]}"
-        user_message = UserMessage(text=prompt)
-        response = await chat.send_message(user_message)
-        
-        # Parse response
+            raise HTTPException(status_code=400, detail="No notes found")
+
+        context = "\n\n".join([f"{n['title']}\n{n['content'][:1000]}" for n in notes])
+
+        prompt = f"""Generate {request.num_questions} multiple choice questions on: {request.topic}
+
+Content:
+{context[:3000]}
+
+Return ONLY a JSON array. Each object must have:
+- "question": string
+- "options": array of 4 strings
+- "correct_answer": number 0-3
+
+No extra text, just the JSON array."""
+
+        response = await ask_gemini(prompt)
+
         import re
         json_match = re.search(r'\[.*\]', response, re.DOTALL)
-        if json_match:
-            questions_data = json.loads(json_match.group())
-            questions = [QuizQuestion(**q) for q in questions_data]
-        else:
+        if not json_match:
             raise HTTPException(status_code=500, detail="Failed to generate quiz")
-        
-        # Save quiz
-        quiz = Quiz(
-            user_id=user.id,
-            course_id=request.course_id,
-            title=f"Quiz: {request.topic}",
-            questions=questions
-        )
+
+        questions_data = json.loads(json_match.group())
+        questions = [QuizQuestion(**q) for q in questions_data]
+
+        quiz = Quiz(user_id=user.id, course_id=request.course_id,
+                    title=f"Quiz: {request.topic}", questions=questions)
         await db.quizzes.insert_one(quiz.dict())
-        
         return quiz
-    
+
     except Exception as e:
-        logger.error(f"Error generating quiz: {str(e)}")
+        logger.error(f"Quiz error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.get("/quiz/{quiz_id}")
-async def get_quiz(quiz_id: str, user: User = Depends(get_current_user)):
-    """Get a quiz"""
-    quiz = await db.quizzes.find_one({"id": quiz_id, "user_id": user.id})
-    if not quiz:
-        raise HTTPException(status_code=404, detail="Quiz not found")
-    return Quiz(**quiz)
+# ==================== Calendar ====================
 
-# ==================== Dashboard Routes ====================
+@api_router.get("/calendar/events")
+async def get_calendar_events(month: int = None, year: int = None, user: User = Depends(get_current_user)):
+    if not month or not year:
+        now = datetime.utcnow()
+        month, year = now.month, now.year
 
-@api_router.get("/sync/stats")
-async def get_sync_stats(user: User = Depends(get_current_user)):
-    """Get statistics about synced data"""
-    try:
-        # Get all courses
-        courses = await db.courses.find({"user_id": user.id}).to_list(100)
-        
-        stats = {
-            "total_courses": len(courses),
-            "total_notes": 0,
-            "total_assignments": 0,
-            "courses_detail": []
-        }
-        
-        for course in courses:
-            notes_count = await db.notes.count_documents({
-                "user_id": user.id,
-                "course_id": course['id']
+    start_date = datetime(year, month, 1)
+    end_date = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+
+    assignments = await db.assignments.find({
+        "user_id": user.id,
+        "due_date": {"$gte": start_date, "$lt": end_date}
+    }).to_list(1000)
+
+    notes = await db.notes.find({
+        "user_id": user.id,
+        "created_at": {"$gte": start_date, "$lt": end_date}
+    }).to_list(1000)
+
+    course_ids = set([a['course_id'] for a in assignments] + [n.get('course_id') for n in notes if n.get('course_id')])
+    courses_map = {}
+    for cid in course_ids:
+        if cid:
+            c = await db.courses.find_one({"id": cid, "user_id": user.id})
+            if c:
+                courses_map[cid] = c['name']
+
+    events_by_date = {}
+    for a in assignments:
+        if a.get('due_date'):
+            key = a['due_date'].strftime('%Y-%m-%d')
+            if key not in events_by_date:
+                events_by_date[key] = {"assignments": [], "notes": []}
+            events_by_date[key]["assignments"].append({
+                "id": a['id'], "title": a['title'],
+                "course_name": courses_map.get(a['course_id'], 'Unknown'),
+                "state": a.get('state', 'PENDING')
             })
-            
-            assignments_count = await db.assignments.count_documents({
-                "user_id": user.id,
-                "course_id": course['id']
-            })
-            
-            # Get sample notes
-            sample_notes = await db.notes.find({
-                "user_id": user.id,
-                "course_id": course['id']
-            }).limit(3).to_list(3)
-            
-            stats["total_notes"] += notes_count
-            stats["total_assignments"] += assignments_count
-            
-            stats["courses_detail"].append({
-                "name": course['name'],
-                "notes_count": notes_count,
-                "assignments_count": assignments_count,
-                "sample_notes": [
-                    {
-                        "title": note['title'],
-                        "content_preview": note['content'][:200] + "..."
-                    }
-                    for note in sample_notes
-                ]
-            })
-        
-        return stats
-    
-    except Exception as e:
-        logger.error(f"Error getting sync stats: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
+    for n in notes:
+        key = n['created_at'].strftime('%Y-%m-%d')
+        if key not in events_by_date:
+            events_by_date[key] = {"assignments": [], "notes": []}
+        events_by_date[key]["notes"].append({
+            "id": n['id'], "title": n['title'],
+            "course_name": courses_map.get(n.get('course_id'), 'Unknown')
+        })
 
-@api_router.get("/sync/email")
-async def sync_email(user: User = Depends(get_current_user)):
-    """Sync academic emails and extract attachments"""
-    try:
-        creds = get_google_credentials(user)
-        gmail_service = build('gmail', 'v1', credentials=creds)
-        drive_service = build('drive', 'v3', credentials=creds)
-        
-        logger.info(f"Starting email sync for user: {user.email}")
-        
-        # Get user's courses for mapping
-        courses = await db.courses.find({"user_id": user.id}).to_list(100)
-        course_names = [c['name'].lower() for c in courses]
-        course_map = {c['name'].lower(): c['id'] for c in courses}
-        
-        # Query for academic emails with attachments
-        query = 'has:attachment newer_than:30d'
-        
-        results = gmail_service.users().messages().list(
-            userId='me',
-            q=query,
-            maxResults=50
-        ).execute()
-        
-        messages = results.get('messages', [])
-        logger.info(f"Found {len(messages)} emails with attachments")
-        
-        synced_attachments = 0
-        synced_updates = 0
-        unsorted_count = 0
-        
-        for msg_ref in messages:
-            try:
-                # Get full message
-                message = gmail_service.users().messages().get(
-                    userId='me',
-                    id=msg_ref['id'],
-                    format='full'
-                ).execute()
-                
-                # Extract headers
-                headers = message['payload']['headers']
-                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
-                sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
-                date_str = next((h['value'] for h in headers if h['name'] == 'Date'), '')
-                
-                # Parse date
-                from email.utils import parsedate_to_datetime
-                received_date = parsedate_to_datetime(date_str) if date_str else datetime.utcnow()
-                
-                # Check if academic
-                academic_keywords = ['assignment', 'lecture', 'class', 'exam', 'submission', 'syllabus', 'notes']
-                is_academic = any(kw in subject.lower() for kw in academic_keywords) or '@atlasskilltech' in sender
-                
-                if not is_academic:
-                    continue
-                
-                logger.info(f"Processing email: {subject[:50]}...")
-                
-                # Check for attachments
-                parts = message['payload'].get('parts', [])
-                
-                def get_attachments(parts):
-                    attachments = []
-                    for part in parts:
-                        if part.get('filename'):
-                            attachments.append(part)
-                        if part.get('parts'):
-                            attachments.extend(get_attachments(part['parts']))
-                    return attachments
-                
-                attachments = get_attachments(parts)
-                
-                if not attachments:
-                    continue
-                
-                # Try to map to course
-                mapped_course_id = None
-                confidence = 0.0
-                
-                # Simple keyword matching
-                for course_name in course_names:
-                    if course_name in subject.lower():
-                        mapped_course_id = course_map[course_name]
-                        confidence = 0.9
-                        break
-                
-                # Determine category
-                is_circular = 'circular' in subject.lower() or 'announcement' in subject.lower()
-                is_exam = 'exam' in subject.lower() or 'test' in subject.lower()
-                is_timetable = 'timetable' in subject.lower() or 'schedule' in subject.lower()
-                
-                # Process attachments
-                for attachment in attachments[:3]:  # Limit to 3 per email
-                    filename = attachment['filename']
-                    
-                    if not any(filename.lower().endswith(ext) for ext in ['.pdf', '.docx', '.pptx', '.doc', '.ppt']):
-                        continue
-                    
-                    try:
-                        # Get attachment data
-                        att_id = attachment['body'].get('attachmentId')
-                        if not att_id:
-                            continue
-                        
-                        att_data = gmail_service.users().messages().attachments().get(
-                            userId='me',
-                            messageId=msg_ref['id'],
-                            id=att_id
-                        ).execute()
-                        
-                        file_data = base64.urlsafe_b64decode(att_data['data'])
-                        
-                        # Extract text
-                        text_content = ""
-                        if filename.lower().endswith('.pdf'):
-                            text_content = await extract_text_from_pdf(file_data)
-                        elif filename.lower().endswith('.docx'):
-                            text_content = await extract_text_from_docx(file_data)
-                        
-                        # Determine final category
-                        if is_circular or is_exam or is_timetable:
-                            # Store as university update
-                            update = UniversityUpdate(
-                                user_id=user.id,
-                                title=subject,
-                                sender=sender,
-                                received_date=received_date,
-                                summary=subject,
-                                category='exam' if is_exam else 'timetable' if is_timetable else 'general',
-                                attachments=[{
-                                    'filename': filename,
-                                    'size': len(file_data)
-                                }],
-                                email_id=msg_ref['id'],
-                                body_text=text_content[:500]
-                            )
-                            
-                            existing = await db.university_updates.find_one({
-                                "email_id": msg_ref['id'],
-                                "user_id": user.id
-                            })
-                            
-                            if not existing:
-                                await db.university_updates.insert_one(update.dict())
-                                synced_updates += 1
-                                logger.info(f"✅ Saved university update: {subject[:50]}")
-                        
-                        # Store as email attachment
-                        email_att = EmailAttachment(
-                            user_id=user.id,
-                            course_id=mapped_course_id,
-                            email_id=msg_ref['id'],
-                            subject=subject,
-                            sender=sender,
-                            received_date=received_date,
-                            file_name=filename,
-                            file_type='PDF' if filename.lower().endswith('.pdf') else 'Document',
-                            content=text_content[:10000] if text_content else "",
-                            category='course_material' if mapped_course_id else 'unsorted',
-                            confidence=confidence,
-                            source='email'
-                        )
-                        
-                        existing_att = await db.email_attachments.find_one({
-                            "email_id": msg_ref['id'],
-                            "file_name": filename,
-                            "user_id": user.id
-                        })
-                        
-                        if not existing_att:
-                            await db.email_attachments.insert_one(email_att.dict())
-                            
-                            # Also create as Note if mapped to course
-                            if mapped_course_id and text_content:
-                                note = Note(
-                                    user_id=user.id,
-                                    course_id=mapped_course_id,
-                                    title=filename,
-                                    content=text_content[:10000],
-                                    attachments=[{
-                                        'type': 'email',
-                                        'email_id': msg_ref['id'],
-                                        'sender': sender,
-                                        'subject': subject
-                                    }]
-                                )
-                                
-                                await db.notes.insert_one(note.dict())
-                            
-                            synced_attachments += 1
-                            
-                            if not mapped_course_id:
-                                unsorted_count += 1
-                            
-                            logger.info(f"✅ Saved attachment: {filename} ({'mapped' if mapped_course_id else 'unsorted'})")
-                    
-                    except Exception as att_error:
-                        logger.error(f"Error processing attachment {filename}: {str(att_error)}")
-            
-            except Exception as msg_error:
-                logger.error(f"Error processing message: {str(msg_error)}")
-        
-        logger.info(f"Email sync complete: {synced_attachments} attachments, {synced_updates} updates, {unsorted_count} unsorted")
-        
-        return {
-            "message": "Email sync completed",
-            "attachments_synced": synced_attachments,
-            "updates_synced": synced_updates,
-            "unsorted_count": unsorted_count
-        }
-    
-    except Exception as e:
-        logger.error(f"Error syncing email: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"month": month, "year": year, "events_by_date": events_by_date,
+            "total_assignments": len(assignments), "total_notes": len(notes)}
 
-
-@api_router.get("/updates/university")
-async def get_university_updates(
-    category: str = None,
-    user: User = Depends(get_current_user)
-):
-    """Get university updates/circulars"""
-    try:
-        query = {"user_id": user.id}
-        if category and category != 'all':
-            query["category"] = category
-        
-        updates = await db.university_updates.find(query).sort("received_date", -1).to_list(100)
-        
-        return {
-            "total": len(updates),
-            "updates": [UniversityUpdate(**u) for u in updates]
-        }
-    
-    except Exception as e:
-        logger.error(f"Error getting updates: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.get("/email/unsorted")
-async def get_unsorted_files(user: User = Depends(get_current_user)):
-    """Get unsorted academic files from email"""
-    try:
-        unsorted = await db.email_attachments.find({
-            "user_id": user.id,
-            "category": "unsorted"
-        }).sort("received_date", -1).to_list(100)
-        
-        return {
-            "total": len(unsorted),
-            "files": [EmailAttachment(**f) for f in unsorted]
-        }
-    
-    except Exception as e:
-        logger.error(f"Error getting unsorted files: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.patch("/email/attachment/{attachment_id}/map")
-async def map_attachment_to_course(
-    attachment_id: str,
-    course_id: str,
-    user: User = Depends(get_current_user)
-):
-    """Manually map an email attachment to a course"""
-    try:
-        result = await db.email_attachments.update_one(
-            {"id": attachment_id, "user_id": user.id},
-            {"$set": {
-                "course_id": course_id,
-                "category": "course_material",
-                "confidence": 1.0
-            }}
-        )
-        
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Attachment not found")
-        
-        return {"message": "Attachment mapped successfully"}
-    
-    except Exception as e:
-        logger.error(f"Error mapping attachment: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+# ==================== Dashboard ====================
 
 @api_router.get("/dashboard")
 async def get_dashboard(user: User = Depends(get_current_user)):
-    """Get dashboard data"""
-    # Get today's assignments
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     tomorrow = today + timedelta(days=1)
-    
+    next_week = today + timedelta(days=7)
+
     today_assignments = await db.assignments.find({
         "user_id": user.id,
         "due_date": {"$gte": today, "$lt": tomorrow},
         "state": "PENDING"
     }).to_list(100)
-    
-    # Get upcoming assignments (next 7 days)
-    next_week = today + timedelta(days=7)
-    upcoming_assignments = await db.assignments.find({
+
+    upcoming = await db.assignments.find({
         "user_id": user.id,
         "due_date": {"$gte": tomorrow, "$lt": next_week},
         "state": "PENDING"
     }).sort("due_date", 1).to_list(100)
-    
-    # Get recent notes
-    recent_notes = await db.notes.find({
-        "user_id": user.id
-    }).sort("updated_at", -1).limit(5).to_list(5)
-    
-    # Get courses count
+
+    recent_notes = await db.notes.find({"user_id": user.id}).sort("updated_at", -1).limit(5).to_list(5)
     courses_count = await db.courses.count_documents({"user_id": user.id})
-    
+
     return {
         "today_assignments": [Assignment(**a) for a in today_assignments],
-        "upcoming_assignments": [Assignment(**a) for a in upcoming_assignments],
+        "upcoming_assignments": [Assignment(**a) for a in upcoming],
         "recent_notes": [Note(**n) for n in recent_notes],
         "courses_count": courses_count
     }
 
-# Include the router in the main app
+
+@api_router.get("/sync/stats")
+async def get_sync_stats(user: User = Depends(get_current_user)):
+    courses = await db.courses.find({"user_id": user.id}).to_list(100)
+    stats = {"total_courses": len(courses), "total_notes": 0, "total_assignments": 0, "courses_detail": []}
+
+    for course in courses:
+        notes_count = await db.notes.count_documents({"user_id": user.id, "course_id": course['id']})
+        assignments_count = await db.assignments.count_documents({"user_id": user.id, "course_id": course['id']})
+        stats["total_notes"] += notes_count
+        stats["total_assignments"] += assignments_count
+        stats["courses_detail"].append({
+            "name": course['name'],
+            "notes_count": notes_count,
+            "assignments_count": assignments_count
+        })
+    return stats
+
+# ==================== Email Sync ====================
+
+@api_router.get("/sync/email")
+async def sync_email(user: User = Depends(get_current_user)):
+    try:
+        creds = get_google_credentials(user)
+        gmail_service = build('gmail', 'v1', credentials=creds)
+
+        courses = await db.courses.find({"user_id": user.id}).to_list(100)
+        course_map = {c['name'].lower(): c['id'] for c in courses}
+
+        results = gmail_service.users().messages().list(
+            userId='me', q='has:attachment newer_than:30d', maxResults=50
+        ).execute()
+
+        messages = results.get('messages', [])
+        synced = 0
+
+        for msg_ref in messages:
+            try:
+                message = gmail_service.users().messages().get(
+                    userId='me', id=msg_ref['id'], format='full'
+                ).execute()
+
+                headers = message['payload']['headers']
+                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+                sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+                date_str = next((h['value'] for h in headers if h['name'] == 'Date'), '')
+
+                from email.utils import parsedate_to_datetime
+                received_date = parsedate_to_datetime(date_str) if date_str else datetime.utcnow()
+
+                academic_keywords = ['assignment', 'lecture', 'class', 'exam', 'submission', 'syllabus', 'notes']
+                if not any(kw in subject.lower() for kw in academic_keywords):
+                    continue
+
+                parts = message['payload'].get('parts', [])
+
+                def get_attachments(parts):
+                    atts = []
+                    for part in parts:
+                        if part.get('filename'):
+                            atts.append(part)
+                        if part.get('parts'):
+                            atts.extend(get_attachments(part['parts']))
+                    return atts
+
+                attachments = get_attachments(parts)
+
+                mapped_course_id = None
+                for course_name in course_map:
+                    if course_name in subject.lower():
+                        mapped_course_id = course_map[course_name]
+                        break
+
+                for attachment in attachments[:3]:
+                    filename = attachment['filename']
+                    if not any(filename.lower().endswith(ext) for ext in ['.pdf', '.docx', '.pptx']):
+                        continue
+
+                    att_id = attachment['body'].get('attachmentId')
+                    if not att_id:
+                        continue
+
+                    existing = await db.email_attachments.find_one({
+                        "email_id": msg_ref['id'], "file_name": filename, "user_id": user.id
+                    })
+                    if existing:
+                        continue
+
+                    att_data = gmail_service.users().messages().attachments().get(
+                        userId='me', messageId=msg_ref['id'], id=att_id
+                    ).execute()
+
+                    file_data = base64.urlsafe_b64decode(att_data['data'])
+                    text_content = ""
+                    if filename.lower().endswith('.pdf'):
+                        text_content = await extract_text_from_pdf(file_data)
+                    elif filename.lower().endswith('.docx'):
+                        text_content = await extract_text_from_docx(file_data)
+
+                    email_att = EmailAttachment(
+                        user_id=user.id, course_id=mapped_course_id,
+                        email_id=msg_ref['id'], subject=subject, sender=sender,
+                        received_date=received_date, file_name=filename,
+                        file_type='PDF' if filename.lower().endswith('.pdf') else 'Document',
+                        content=text_content[:10000], category='course_material' if mapped_course_id else 'unsorted',
+                        confidence=0.9 if mapped_course_id else 0.0
+                    )
+                    await db.email_attachments.insert_one(email_att.dict())
+                    synced += 1
+
+            except Exception as e:
+                logger.error(f"Email processing error: {str(e)}")
+
+        return {"message": "Email sync completed", "attachments_synced": synced}
+
+    except Exception as e:
+        logger.error(f"Email sync error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== App Setup ====================
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -1916,13 +990,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
